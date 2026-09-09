@@ -7,10 +7,15 @@ import plugin, {
   persistToRollingCache,
   MAX_IMAGES_IN_CONTEXT,
   DEFAULT_MAX_IMAGES_IN_CONTEXT,
+  MAX_IMAGE_BYTES,
+  DEFAULT_MAX_IMAGE_BYTES,
   setCacheDir,
   getCacheDir,
   setMaxImages,
   getMaxImages,
+  setMaxImageBytes,
+  getMaxImageBytes,
+  parseByteString,
   enforceCacheCap,
 } from "./index";
 
@@ -19,6 +24,7 @@ const TEST_CACHE_DIR = path.join(os.tmpdir(), "opencode-prune-images-test-" + Da
 beforeEach(() => {
   setCacheDir(TEST_CACHE_DIR);
   setMaxImages(DEFAULT_MAX_IMAGES_IN_CONTEXT);
+  setMaxImageBytes(DEFAULT_MAX_IMAGE_BYTES);
 });
 
 afterEach(() => {
@@ -36,6 +42,10 @@ test("exports standard defaults and getters/setters", () => {
   expect(MAX_IMAGES_IN_CONTEXT).toBe(7);
   expect(getMaxImages()).toBe(7);
 
+  expect(DEFAULT_MAX_IMAGE_BYTES).toBe(8 * 1024 * 1024);
+  expect(MAX_IMAGE_BYTES).toBe(8 * 1024 * 1024);
+  expect(getMaxImageBytes()).toBe(8 * 1024 * 1024);
+
   setMaxImages(4);
   expect(getMaxImages()).toBe(4);
 
@@ -47,6 +57,19 @@ test("exports standard defaults and getters/setters", () => {
 
   setMaxImages(7);
   expect(getMaxImages()).toBe(7);
+
+  setMaxImageBytes(6 * 1024 * 1024);
+  expect(getMaxImageBytes()).toBe(6 * 1024 * 1024);
+  setMaxImageBytes(-100);
+  expect(getMaxImageBytes()).toBe(6 * 1024 * 1024);
+  setMaxImageBytes(Number.NaN);
+  expect(getMaxImageBytes()).toBe(6 * 1024 * 1024);
+  setMaxImageBytes(8 * 1024 * 1024);
+  expect(getMaxImageBytes()).toBe(8 * 1024 * 1024);
+
+  expect(parseByteString("8MB")).toBe(8 * 1024 * 1024);
+  expect(parseByteString("64kb")).toBe(64 * 1024);
+  expect(parseByteString("1048576")).toBe(1048576);
 
   expect(getCacheDir()).toBe(TEST_CACHE_DIR);
 });
@@ -243,6 +266,151 @@ test("handles empty or malformed inputs without throwing", () => {
   expect(pruneImages({ messages: [] })).toBe(0);
   expect(pruneImages({ messages: "invalid" as unknown as unknown[] })).toBe(0);
   expect(pruneImages([{ broken: true }])).toBe(0);
+});
+
+test("dual-budget cap: prunes older images exceeding maxBytes even when count is under maxImages", () => {
+  // Create 4 images, each approx 2.5 MB of payload (total 10 MB).
+  // With maxBytes = 6 MB and maxImages = 7:
+  // Count is 4 <= 7, but byte total is 10 MB > 6 MB!
+  // It should retain the 2 newest (2 * 2.5MB = 5MB <= 6MB) and prune the older 2!
+  const chunk2_5MB = "A".repeat(2_500_000);
+  const makeLargeImg = (id: number) => ({
+    type: "image",
+    filename: `big-render-${id}.png`,
+    data: `data:image/png;base64,${chunk2_5MB}`,
+  });
+
+  const messages = [
+    {
+      role: "user",
+      content: "Analyze visual rendering performance",
+      parts: [
+        { type: "text", text: "Frame 1" },
+        makeLargeImg(1),
+        { type: "text", text: "Frame 2" },
+        makeLargeImg(2),
+      ],
+    },
+    {
+      role: "assistant",
+      content: "Observed first two frames.",
+    },
+    {
+      role: "user",
+      content: "Here are frames 3 and 4",
+      parts: [
+        { type: "text", text: "Frame 3" },
+        makeLargeImg(3),
+        { type: "text", text: "Frame 4" },
+        makeLargeImg(4),
+      ],
+    },
+  ];
+
+  // maxImages = 7 (allows all 4 by count), maxBytes = 6 MB
+  const maxBytes = 6 * 1024 * 1024;
+  const pruned = pruneImages({ messages }, 7, maxBytes);
+
+  expect(pruned).toBe(2);
+
+  // Frames 1 and 2 (older) pruned to 3-point cards
+  expect(messages[0].parts[1].type).toBe("text");
+  expect((messages[0].parts[1] as { text?: string }).text).toContain("[Pruned Image:");
+  expect((messages[0].parts[1] as { text?: string }).text).toContain("big-render-1.png");
+
+  expect(messages[0].parts[3].type).toBe("text");
+  expect((messages[0].parts[3] as { text?: string }).text).toContain("[Pruned Image:");
+  expect((messages[0].parts[3] as { text?: string }).text).toContain("big-render-2.png");
+
+  // Frames 3 and 4 (newest) kept intact
+  expect(messages[2].parts[1].type).toBe("image");
+  expect(messages[2].parts[3].type).toBe("image");
+});
+
+test("causal chain context extraction across multi-step tool loops", () => {
+  // Multi-step loop:
+  // user -> tool(bash) -> tool(read image) -> tool(grep) -> assistant("Found 12px alignment issue")
+  const messages = [
+    {
+      role: "user",
+      content: "Check UI alignment on the checkout button",
+    },
+    {
+      role: "tool",
+      content: [
+        {
+          tool: "bash",
+          result: "git status: clean",
+        },
+      ],
+    },
+    {
+      role: "tool",
+      content: [
+        {
+          tool: "read_screenshot",
+          result: "Image read successfully.", // boilerplate!
+        },
+      ],
+      parts: [
+        {
+          type: "image",
+          filename: "checkout-button.png",
+          data: "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==",
+        },
+      ],
+    },
+    {
+      role: "tool",
+      content: [
+        {
+          tool: "grep",
+          result: "padding: 8px;",
+        },
+      ],
+    },
+    {
+      role: "assistant",
+      content: "Found 12px alignment issue where button padding is overflowing container bounds.",
+    },
+  ];
+
+  // Cap at 0 images so it prunes
+  const pruned = pruneImages({ messages }, 0);
+  expect(pruned).toBe(1);
+
+  const prunedPart = messages[2].parts[0] as { type: string; text: string };
+  expect(prunedPart.type).toBe("text");
+  expect(prunedPart.text).toContain("[Pruned Image:");
+  // Intent should crawl backwards skipping intermediate tools to reach user prompt
+  expect(prunedPart.text).toContain("Check UI alignment on the checkout button");
+  // Observed should skip "Image read successfully." boilerplate and forward crawl to assistant synthesis!
+  expect(prunedPart.text).toContain("Found 12px alignment issue where button padding is overflowing");
+});
+
+test("defensively avoids double-wrapping already pruned image cards", () => {
+  const messages = [
+    {
+      role: "user",
+      content: "Test already pruned",
+      parts: [
+        {
+          type: "text",
+          text: "[Pruned Image: /some/path/img.png]\n• What's visible: Something\n• Why it was captured: Prior task\n• Recall: Read from path",
+        },
+        {
+          type: "image",
+          filename: "new-capture.png",
+          data: "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==",
+        },
+      ],
+    },
+  ];
+
+  // When prune is run with maxImages = 1, new-capture is kept, pruned card is not touched
+  const pruned = pruneImages({ messages }, 1);
+  expect(pruned).toBe(0);
+  expect((messages[0].parts[0] as { text: string }).text).not.toContain("[Pruned Image: [Pruned Image:");
 });
 
 test("plugin structure satisfies OpenCode plugin signature", async () => {

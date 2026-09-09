@@ -1,14 +1,14 @@
 # opencode-prune-images
 
-Keep OpenCode chats fast, responsive, and crash-free by capping active visual images sent to the LLM.
+Keep OpenCode chats fast, responsive, and crash-free with dual-budget context management and causal semantic anchoring.
 
-When agent workflows use browser tools (Playwright, Chrome DevTools, computer-use, or visual verification loops), sessions quickly accumulate dozens of base64 screenshots. Upstream providers eventually reject requests with fatal errors:
+When agent workflows use browser tools (Playwright, Chrome DevTools, computer-use, or visual verification loops), sessions quickly accumulate dozens of base64 screenshots. Upstream providers and gateways reject requests with fatal errors:
 
-- `413 Request Entity Too Large`
-- `Request contains too many images`
-- Provider-specific payload limits or token exhaustion
+- `413 Request Entity Too Large` (request body caps on Cloudflare, Qwen, Azure OpenAI, etc.)
+- `Request contains too many images` (Console Go > 50 images, Anthropic > 20 without resizing)
+- Provider token exhaustion and latency degradation
 
-Once that happens, the session gets wedged because the bulky images remain in conversation history. `opencode-prune-images` intercepts the dispatch context in-memory, retains the latest high-resolution images, summarizes earlier images into structured recall cards, and persists captures to a rolling local disk buffer.
+Once that happens, the session gets wedged because the bulky images remain in conversation history. `opencode-prune-images` intercepts the dispatch context in-memory, enforces a **dual-budget constraint (Count + Payload Bytes)**, links images to their **causal user intent and model findings**, summarizes older images into structured 3-point recall cards, and persists captures to a rolling local FIFO disk buffer.
 
 ---
 
@@ -24,11 +24,14 @@ Once that happens, the session gets wedged because the bulky images remain in co
 ┌───────────────────────────────────────────────────────────┐
 │                 opencode-prune-images                     │
 │                                                           │
-│  1. Scan & Count images across parts, tool results, data  │
-│  2. If images > MAX_IMAGES (default: 7):                  │
+│  1. Scan all images and estimate payload byte size        │
+│  2. Greedy Dual-Budget Allocation (Newest to Oldest):     │
+│     • Count Budget: Keep <= MAX_IMAGES (default: 7)       │
+│     • Byte Budget: Keep <= MAX_IMAGE_BYTES (default: 8MB) │
+│  3. For images exceeding either budget:                   │
 │     • Persist ephemeral captures to rolling FIFO cache    │
-│     • Extract intent & model observation from context     │
-│     • Convert older images to 3-point Markdown cards      │
+│     • Causal Context Extraction (User Intent + Finding)   │
+│     • Convert into 3-point Markdown context cards         │
 │     • Keep newest images intact in full visual fidelity   │
 └─────────────────────────────┬─────────────────────────────┘
                               │
@@ -43,14 +46,15 @@ Pruned images are replaced in-memory with a structured 3-point context card:
 
 ```markdown
 [Pruned Image: /Users/username/.cache/opencode/recent-images/img_3f8a91b2c4e5f607.png]
-• What's visible: Login modal with email field and sign-in button (screenshot.png)
-• Why it was captured: Verify login modal layout after form submission
+• What's visible: Found 12px alignment issue where button padding is overflowing container bounds. (checkout-button.png)
+• Why it was captured: Check UI alignment on the checkout button
 • Recall: If needed again, read from `/Users/username/.cache/opencode/recent-images/img_3f8a91b2c4e5f607.png`. If missing, rely on the summary above—or if safe to reproduce, re-capture the screen.
 ```
 
-- **Natural Recall**: The model retains full conversational context. If you or the agent need to inspect an older image again, the model reads the cached path and pulls it back into view.
-- **Zero History Corruption**: Transformations happen exclusively in-memory right before provider dispatch. Your persisted SQLite session history is untouched.
-- **Persistent Rolling Buffer**: Base64 payloads and ephemeral `/tmp` screenshots are copied to `~/.cache/opencode/recent-images/` with a strict FIFO cap (default 100 files). Images survive even if system `/tmp` is wiped.
+- **Dual-Budget Protection**: Constrains both image count (default 7) and cumulative payload size (default 8MB). Even if you have only 3 large retina 4K screenshots (e.g. 15MB), the byte-budget prunes older frames to keep the request safely under gateway 413 limits.
+- **Causal Semantic Anchoring**: In complex multi-turn tool loops (`user -> tool(bash) -> tool(read image) -> tool(grep) -> assistant("Found bug...")`), the synthesizer crawls backwards to isolate the originating user prompt and forward up to 6 turns to capture the assistant's visual findings, skipping boilerplate tool output like "Image read successfully".
+- **Defensive & Non-Destructive**: Never double-wraps existing cards or markers. Transformations happen purely in-memory right before provider dispatch; your persisted SQLite session history is untouched.
+- **Persistent Rolling Buffer**: Base64 payloads and ephemeral `/tmp` screenshots are copied to `~/.cache/opencode/recent-images/` with a strict FIFO cap (default 100 files).
 - **Zero Runtime Dependencies**: Written in pure TypeScript using native Node.js / Bun standard library modules (`node:fs`, `node:path`, `node:crypto`, `node:os`).
 
 ---
@@ -89,18 +93,21 @@ npm install -g opencode-prune-images
 
 ## Configuration
 
-`opencode-prune-images` works out of the box with safe, production-tested defaults (7 active images, 100 cached files). You can customize behavior via environment variables or programmatically:
+`opencode-prune-images` works out of the box with safe, production-tested defaults:
 
 | Setting | Default | Environment Variable | Description |
 | :--- | :--- | :--- | :--- |
-| **Max Images in Context** | `7` | `OPENCODE_MAX_IMAGES` | Number of recent images preserved in full resolution sent to the model. |
+| **Max Images in Context** | `7` | `OPENCODE_MAX_IMAGES` | Maximum number of recent images preserved in full resolution sent to the model. |
+| **Max Image Payload Bytes** | `8388608` (8 MB) | `OPENCODE_MAX_IMAGE_BYTES` | Maximum cumulative image byte size allowed in active context (supports `8MB`, `6MB`, `500KB`, etc.). |
 | **Max Cache Files** | `100` | — | Maximum files kept in the FIFO rolling buffer before oldest are deleted. |
 | **Cache Directory** | `~/.cache/opencode/recent-images` | — | Location where pruned / ephemeral screenshots are backed up. |
 
-### Example: Setting Image Cap via Shell / Config
+### Example: Environment Configuration
 
 ```bash
+# Set custom image count and payload byte limit
 export OPENCODE_MAX_IMAGES=5
+export OPENCODE_MAX_IMAGE_BYTES=6MB
 ```
 
 ### Programmatic API
@@ -108,10 +115,16 @@ export OPENCODE_MAX_IMAGES=5
 If importing or wrapping the plugin in your own setup:
 
 ```typescript
-import { setMaxImages, setCacheDir, pruneImages } from "opencode-prune-images";
+import {
+  setMaxImages,
+  setMaxImageBytes,
+  setCacheDir,
+  pruneImages
+} from "opencode-prune-images";
 
-// Set custom window size
+// Set custom count and byte limits
 setMaxImages(5);
+setMaxImageBytes(6 * 1024 * 1024); // 6MB
 
 // Set custom cache location
 setCacheDir("/path/to/custom/cache");
@@ -121,11 +134,14 @@ setCacheDir("/path/to/custom/cache");
 
 ## Troubleshooting & FAQ
 
-#### Why 7 images by default?
-7 images provide enough visual history for multi-step browser interactions (e.g. navigation, modal open, form input, error state, retry, success verification) while remaining comfortably within the strict payload and token budgets of major vision models (Gemini, Claude 3.7/4.6, GPT-4o/5.6/6).
+#### Why a dual budget (count + bytes)?
+Vision models and cloud reverse proxies enforce independent bottlenecks:
+1. Model providers reject queries with too many image parts (e.g. 20-50 images max).
+2. Reverse proxies and serverless gateways (Cloudflare, Azure, AWS API Gateway) reject requests exceeding body size limits (e.g. 6MB to 32MB HTTP payloads).
+A dual-budget guarantees that neither limit will ever be exceeded.
 
 #### Does this delete my screenshots from disk?
-No. Your original screenshots in project directories are never deleted. Only the rolling cache directory (`~/.cache/opencode/recent-images/`) enforces a FIFO cap (default 100 items) to prevent disk bloat over months of automated work.
+No. Original screenshots in project directories are never touched. Only the rolling cache directory (`~/.cache/opencode/recent-images/`) enforces a FIFO cap (default 100 items) to prevent disk bloat over months of automated work.
 
 #### What happens if the agent needs to see an image that was pruned?
 The card provides the exact file path to the cached image. The agent can use any file-reading or image-reading tool (such as `read` or browser inspection) to reload it into active context.

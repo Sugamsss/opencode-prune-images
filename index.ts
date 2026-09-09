@@ -17,9 +17,9 @@
  *      • Why it was captured: <user intent / task context>
  *      • Recall: If needed again, read from `<cached_path>`.
  *
- * 3. Active Window Cap:
- *    - Preserves up to 7 (configurable via OPENCODE_MAX_IMAGES or setMaxImages)
- *      latest raw images for provider dispatch.
+ * 3. Dual-Budget Active Window:
+ *    - Preserves up to 7 latest raw images (configurable via OPENCODE_MAX_IMAGES or setMaxImages)
+ *      AND up to 8MB active payload bytes (configurable via OPENCODE_MAX_IMAGE_BYTES or setMaxImageBytes).
  *    - In-place mutation preserving tool call IDs, wrappers, and message structure.
  */
 
@@ -29,6 +29,7 @@ import * as os from "node:os";
 import * as crypto from "node:crypto";
 
 export const DEFAULT_MAX_IMAGES_IN_CONTEXT = 7;
+export const DEFAULT_MAX_IMAGE_BYTES = 8 * 1024 * 1024; // 8 MB
 export const DEFAULT_MAX_CACHE_FILES = 100;
 
 export const DEFAULT_CACHE_DIR = path.join(
@@ -37,6 +38,34 @@ export const DEFAULT_CACHE_DIR = path.join(
   "opencode",
   "recent-images"
 );
+
+export function parseByteString(val: string | undefined): number | undefined {
+  if (!val || typeof val !== "string") return undefined;
+  const trimmed = val.trim();
+  if (!trimmed) return undefined;
+
+  const match = trimmed.match(/^(\d+(?:\.\d+)?)\s*([a-zA-Z]+)?$/);
+  if (!match) return undefined;
+
+  const num = Number.parseFloat(match[1]);
+  if (Number.isNaN(num) || num <= 0) return undefined;
+
+  const unit = match[2]?.toLowerCase() || "";
+  if (!unit || unit === "b" || unit === "bytes") {
+    return Math.floor(num);
+  }
+  if (unit === "k" || unit === "kb" || unit === "kib") {
+    return Math.floor(num * 1024);
+  }
+  if (unit === "m" || unit === "mb" || unit === "mib") {
+    return Math.floor(num * 1024 * 1024);
+  }
+  if (unit === "g" || unit === "gb" || unit === "gib") {
+    return Math.floor(num * 1024 * 1024 * 1024);
+  }
+
+  return Math.floor(num);
+}
 
 function resolveDefaultMaxImages(): number {
   const envVal = process.env.OPENCODE_MAX_IMAGES;
@@ -49,7 +78,17 @@ function resolveDefaultMaxImages(): number {
   return DEFAULT_MAX_IMAGES_IN_CONTEXT;
 }
 
+function resolveDefaultMaxImageBytes(): number {
+  const envVal = process.env.OPENCODE_MAX_IMAGE_BYTES;
+  const parsed = parseByteString(envVal);
+  if (parsed && parsed > 0) {
+    return parsed;
+  }
+  return DEFAULT_MAX_IMAGE_BYTES;
+}
+
 let currentMaxImages = resolveDefaultMaxImages();
+let currentMaxImageBytes = resolveDefaultMaxImageBytes();
 
 export function setMaxImages(count: number): void {
   if (typeof count === "number" && !Number.isNaN(count) && count > 0) {
@@ -61,8 +100,19 @@ export function getMaxImages(): number {
   return currentMaxImages;
 }
 
-// Backward compatibility export
+export function setMaxImageBytes(bytes: number): void {
+  if (typeof bytes === "number" && !Number.isNaN(bytes) && bytes > 0) {
+    currentMaxImageBytes = Math.floor(bytes);
+  }
+}
+
+export function getMaxImageBytes(): number {
+  return currentMaxImageBytes;
+}
+
+// Backward compatibility exports
 export const MAX_IMAGES_IN_CONTEXT = DEFAULT_MAX_IMAGES_IN_CONTEXT;
+export const MAX_IMAGE_BYTES = DEFAULT_MAX_IMAGE_BYTES;
 export const MAX_CACHE_FILES = DEFAULT_MAX_CACHE_FILES;
 
 let currentCacheDir = DEFAULT_CACHE_DIR;
@@ -357,6 +407,7 @@ export interface ImageMeta {
   dimensions?: string;
   source?: string;
   rawBase64?: string;
+  byteSize?: number;
 }
 
 export interface ImageRef {
@@ -411,8 +462,26 @@ function extractMimeFromDataUri(uri: string): string | undefined {
   return match ? match[1].toLowerCase() : undefined;
 }
 
+function isAlreadyPrunedPart(part: unknown): boolean {
+  if (!part) return false;
+  if (typeof part === "string") {
+    return part.includes("[Pruned Image:");
+  }
+  if (typeof part === "object") {
+    const p = part as Record<string, unknown>;
+    if (typeof p.text === "string" && p.text.includes("[Pruned Image:")) {
+      return true;
+    }
+    if (typeof p.content === "string" && p.content.includes("[Pruned Image:")) {
+      return true;
+    }
+  }
+  return false;
+}
+
 function isImagePart(part: unknown): boolean {
   if (!part || typeof part !== "object") return false;
+  if (isAlreadyPrunedPart(part)) return false;
   const p = part as Record<string, unknown>;
 
   if (p.type === "image" || p.type === "image_url") return true;
@@ -577,9 +646,83 @@ function cleanAndTruncate(text: string, maxLen = 180): string {
 }
 
 /**
+ * Estimate byte payload size of an image.
+ * - Base64 string / data URI: data.length (or binary equivalent (data.length * 3) / 4)
+ * - File on disk: fs.statSync().size or Buffer size
+ * - Remote URL: small nominal estimate (500KB)
+ */
+export function estimateImageBytes(meta: ImageMeta): number {
+  if (meta.byteSize && meta.byteSize > 0) {
+    return meta.byteSize;
+  }
+
+  // 1. Raw base64 / data URI
+  if (meta.rawBase64 && typeof meta.rawBase64 === "string") {
+    let raw = meta.rawBase64;
+    const commaIdx = raw.indexOf(",");
+    if (commaIdx !== -1) {
+      raw = raw.slice(commaIdx + 1);
+    }
+    // Using base64 payload length directly as that represents actual memory/wire serialization size
+    return raw.length;
+  }
+
+  // 2. File path on disk
+  if (meta.path && typeof meta.path === "string") {
+    try {
+      const cleanPath = cleanFilePath(meta.path);
+      const resolved = path.resolve(cleanPath);
+      if (fs.existsSync(resolved)) {
+        const stat = fs.statSync(resolved);
+        if (stat.isFile()) {
+          // Convert binary disk size to approximate base64 payload size (* 4 / 3) for parity
+          return Math.ceil((stat.size * 4) / 3);
+        }
+      }
+    } catch {
+      // Fall through
+    }
+  }
+
+  // 3. Remote URL
+  if (meta.url && typeof meta.url === "string") {
+    return 500 * 1024; // 500KB nominal estimate
+  }
+
+  // Generic fallback
+  return 250 * 1024; // 250KB fallback
+}
+
+const BOILERPLATE_PATTERNS = [
+  /^image\s+read\s+successfully\.?$/i,
+  /^screenshot\s+(?:captured|taken|saved)\.?$/i,
+  /^ok\.?$/i,
+  /^success\.?$/i,
+  /^done\.?$/i,
+  /^file\s+read\s+successfully\.?$/i,
+  /^image\s+loaded\.?$/i,
+];
+
+function isSubstantiveText(text: string): boolean {
+  if (!text) return false;
+  const clean = text.trim();
+  if (clean.length < 5) return false;
+  if (isImageDataUri(clean)) return false;
+  if (clean.includes("[Pruned Image:")) return false;
+
+  for (const pattern of BOILERPLATE_PATTERNS) {
+    if (pattern.test(clean)) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+/**
  * Conversational Context Synthesizer:
  * Extracts user intent (from preceding user message) and model observation
- * (from message itself or immediate next assistant turn).
+ * (from message itself or next assistant turn synthesizing visual findings).
  */
 export function synthesizeContext(
   messages: unknown[],
@@ -587,14 +730,16 @@ export function synthesizeContext(
 ): { observed: string; intent: string } {
   const { messageIndex, meta } = imageRef;
 
-  // 1. Extract User Intent
+  // 1. Extract User Intent:
+  // Search backwards from messageIndex to find the originating user turn,
+  // ignoring intermediate assistant/tool turns.
   let intent = "";
   for (let i = messageIndex; i >= 0; i--) {
     const m = messages[i] as Record<string, unknown> | undefined;
     const info = m?.info as Record<string, unknown> | undefined;
     if (m && (m.role === "user" || info?.role === "user")) {
       const txt = extractMessageText(m);
-      if (txt && !isImageDataUri(txt) && !txt.includes("[Pruned Image:")) {
+      if (isSubstantiveText(txt)) {
         intent = cleanAndTruncate(txt, 180);
         break;
       }
@@ -605,28 +750,34 @@ export function synthesizeContext(
     intent = meta.source ? `Captured during ${meta.source}` : "User provided context";
   }
 
-  // 2. Extract Model / Environment Observation
+  // 2. Extract Model / Environment Observation:
+  // Check if current message has substantive text (not boilerplate or empty).
+  // If not, crawl forward up to 6 turns looking for the assistant turn articulating findings.
   let observed = "";
 
-  // Check current message text
   const currentMsgText = extractMessageText(messages[messageIndex]);
-  if (currentMsgText && !isImageDataUri(currentMsgText) && !currentMsgText.includes("[Pruned Image:")) {
-    observed = cleanAndTruncate(currentMsgText, 200);
+  if (isSubstantiveText(currentMsgText)) {
+    observed = cleanAndTruncate(currentMsgText, 180);
   }
 
-  // If not found, check immediate next assistant message
-  if (!observed && messageIndex + 1 < messages.length) {
-    const nextMsg = messages[messageIndex + 1] as Record<string, unknown> | undefined;
-    const nextInfo = nextMsg?.info as Record<string, unknown> | undefined;
-    if (nextMsg && (nextMsg.role === "assistant" || nextInfo?.role === "assistant")) {
-      const nextTxt = extractMessageText(nextMsg);
-      if (nextTxt && !isImageDataUri(nextTxt) && !nextTxt.includes("[Pruned Image:")) {
-        observed = cleanAndTruncate(nextTxt, 200);
+  if (!observed) {
+    const maxForward = Math.min(messages.length, messageIndex + 7); // up to 6 turns forward
+    for (let i = messageIndex + 1; i < maxForward; i++) {
+      const forwardMsg = messages[i] as Record<string, unknown> | undefined;
+      const forwardInfo = forwardMsg?.info as Record<string, unknown> | undefined;
+      const isAssistant = forwardMsg?.role === "assistant" || forwardInfo?.role === "assistant";
+
+      if (isAssistant) {
+        const forwardTxt = extractMessageText(forwardMsg);
+        if (isSubstantiveText(forwardTxt)) {
+          observed = cleanAndTruncate(forwardTxt, 180);
+          break;
+        }
       }
     }
   }
 
-  // Fallback to meta details or append filename
+  // Fallback to meta details or append filename if observed
   if (!observed) {
     const details: string[] = [];
     if (meta.name) details.push(meta.name);
@@ -657,7 +808,7 @@ export function formatThreePointCard(
 /**
  * Recursive crawler to count all image references in any object / array tree.
  */
-function countImagesInValue(val: unknown, seen = new Set<unknown>()): number {
+export function countImagesInValue(val: unknown, seen = new Set<unknown>()): number {
   if (!val) return 0;
   if (typeof val === "string") {
     return isImageDataUri(val) ? 1 : 0;
@@ -687,7 +838,7 @@ function countImagesInValue(val: unknown, seen = new Set<unknown>()): number {
   return count;
 }
 
-function countImagesInMessages(messages: unknown[]): number {
+export function countImagesInMessages(messages: unknown[]): number {
   let count = 0;
   const seen = new Set<unknown>();
 
@@ -889,9 +1040,16 @@ function collectImageRefs(messages: unknown[], target: ImageRef[]): void {
 }
 
 /**
- * Core Prune Routine
+ * Core Prune Routine:
+ * Dual-budget enforcement (Max Images Count + Max Payload Bytes).
+ * Allocates budget greedily from newest to oldest images.
+ * Pruned images are transformed in chronological order (oldest to newest).
  */
-export function pruneImages(event: unknown, maxImages = getMaxImages()): number {
+export function pruneImages(
+  event: unknown,
+  maxImages = getMaxImages(),
+  maxBytes = getMaxImageBytes()
+): number {
   try {
     if (!event || typeof event !== "object") return 0;
 
@@ -904,35 +1062,67 @@ export function pruneImages(event: unknown, maxImages = getMaxImages()): number 
 
     if (!messages || messages.length === 0) return 0;
 
-    const totalImages = countImagesInMessages(messages);
-    if (totalImages <= maxImages) {
-      return 0;
-    }
-
-    const prunedCount = totalImages - maxImages;
     const imageRefs: ImageRef[] = [];
     collectImageRefs(messages, imageRefs);
 
-    for (let i = 0; i < prunedCount; i++) {
+    if (imageRefs.length === 0) {
+      return 0;
+    }
+
+    // 1. Dual-Budget Greedy Allocation from Newest to Oldest
+    // Newest images have the highest conversational value.
+    const keepIndices = new Set<number>();
+    let retainedCount = 0;
+    let retainedBytes = 0;
+
+    for (let i = imageRefs.length - 1; i >= 0; i--) {
+      const ref = imageRefs[i];
+      const imgBytes = estimateImageBytes(ref.meta);
+
+      if (retainedCount < maxImages && retainedBytes + imgBytes <= maxBytes) {
+        keepIndices.add(i);
+        retainedCount++;
+        retainedBytes += imgBytes;
+      }
+    }
+
+    // If all images fit in budget, no-op
+    if (keepIndices.size === imageRefs.length) {
+      return 0;
+    }
+
+    // 2. Identify references to prune and transform in chronological order (oldest to newest)
+    let prunedCount = 0;
+
+    for (let i = 0; i < imageRefs.length; i++) {
+      if (keepIndices.has(i)) {
+        continue;
+      }
+
       const ref = imageRefs[i];
       if (!ref) continue;
 
-      // 1. Ensure persisted to rolling buffer
+      // Defensive check: avoid double-wrapping if already pruned
+      const containerObj = ref.container as Record<string, unknown>;
+      const existing = containerObj[ref.keyOrIndex];
+      if (isAlreadyPrunedPart(existing)) {
+        continue;
+      }
+
+      // a. Ensure persisted to rolling buffer
       const cachedPath =
         persistToRollingCache(ref.meta.rawBase64, ref.meta.path, ref.meta.mime) ||
         ref.meta.path ||
         ref.meta.url ||
         "~/.cache/opencode/recent-images/";
 
-      // 2. Synthesize context from conversational turns
+      // b. Synthesize context from causal conversational turns
       const { observed, intent } = synthesizeContext(messages, ref);
 
-      // 3. Format 3-point card
+      // c. Format 3-point card
       const cardText = formatThreePointCard(cachedPath, observed, intent);
 
-      // 4. In-place replacement
-      const containerObj = ref.container as Record<string, unknown>;
-      const existing = containerObj[ref.keyOrIndex];
+      // d. In-place replacement preserving wrapper and ID
       const existingObj = existing && typeof existing === "object" ? (existing as Record<string, unknown>) : undefined;
       const existingId = existingObj ? existingObj.id : undefined;
 
@@ -957,6 +1147,8 @@ export function pruneImages(event: unknown, maxImages = getMaxImages()): number 
           containerObj.type = "text";
         }
       }
+
+      prunedCount++;
     }
 
     return prunedCount;
@@ -986,7 +1178,7 @@ export default {
       // 1. Session context hook (OpenCode preview / v2 architecture)
       if (ctx?.session?.hook) {
         await ctx.session.hook("context", async (event: unknown) => {
-          pruneImages(event, getMaxImages());
+          pruneImages(event, getMaxImages(), getMaxImageBytes());
         });
       }
 
@@ -994,7 +1186,7 @@ export default {
       if (typeof ctx?.hook === "function") {
         ctx.hook("experimental.chat.messages.transform", async (_input: unknown, output: unknown) => {
           if (output && typeof output === "object" && Array.isArray((output as Record<string, unknown>).messages)) {
-            pruneImages(output, getMaxImages());
+            pruneImages(output, getMaxImages(), getMaxImageBytes());
           }
         });
       }
@@ -1005,7 +1197,7 @@ export default {
   server: async (): Promise<OpenCodePluginHooks> => ({
     "experimental.chat.messages.transform": async (_input: unknown, output: unknown) => {
       if (output && typeof output === "object" && Array.isArray((output as Record<string, unknown>).messages)) {
-        pruneImages(output, getMaxImages());
+        pruneImages(output, getMaxImages(), getMaxImageBytes());
       }
     },
   }),
