@@ -54,7 +54,7 @@ Pruned images are replaced in-memory with a structured 3-point context card:
 • Recall: If needed again, read from `/Users/username/.cache/opencode/recent-images/img_3f8a91b2c4e5f607.png`. If missing, rely on the summary above—or if safe to reproduce, re-capture the screen.
 ```
 
-- **Dual-Budget Protection (Golden 4MB Safe Limit)**: Constrains both image count (default 7) and cumulative wire base64 payload size (default 4MB / 4,194,304 bytes). Providers and gateways like Alibaba/Qwen and AWS Lambda enforce a hard 6.0 MiB ceiling for the entire request; Base64 expansion adds 33% and text context adds 0.5–1.5MB. The 4MB wire limit leaves a reliable 2MB safety margin for zero 413s across all upstream proxies.
+- **Dual-Budget Protection (16MB Wire Limit)**: Constrains both image count (default 7) and cumulative wire base64 payload size (default 16MB / 16,777,216 bytes). Matches OpenCode 2's native 5MB per-image normalization standard and accommodates full-resolution multi-screenshot visual verification loops while staying safely under the 20MB–50MB payload ceilings of modern LLM providers (Bedrock, Gemini, OpenAI, Claude).
 - **Compaction Lifecycle Defense (Zero-Media Strip)**: When OpenCode runs compaction (`event.agent === "compaction"` or `/compact`), the model only outputs a text summary. Sending raw base64 into compaction causes recursive 413 bricking (OpenCode issue #14562). The plugin strips 100% of images to 3-point cards during compaction so the model synthesizes findings purely from text summaries.
 - **Causal Semantic Anchoring**: In complex multi-turn tool loops (`user -> tool(bash) -> tool(read image) -> tool(grep) -> assistant("Found bug...")`), the synthesizer crawls backwards to isolate the originating user prompt and forward up to 6 turns to capture the assistant's visual findings, skipping boilerplate tool output like "Image read successfully".
 - **Defensive & Non-Destructive**: Never double-wraps existing cards or markers. Transformations happen purely in-memory right before provider dispatch; your persisted SQLite session history is untouched.
@@ -102,7 +102,7 @@ npm install -g opencode-prune-images
 | Setting | Default | Environment Variable | Description |
 | :--- | :--- | :--- | :--- |
 | **Max Images in Context** | `7` | `OPENCODE_MAX_IMAGES` | Maximum number of recent images preserved in full resolution sent to the model. |
-| **Max Image Payload Bytes** | `4194304` (4 MB) | `OPENCODE_MAX_IMAGE_BYTES` | Maximum cumulative image wire base64 characters allowed in active context (supports `4MB`, `6MB`, `500KB`, etc.). |
+| **Max Image Payload Bytes** | `16777216` (16 MB) | `OPENCODE_MAX_IMAGE_BYTES` | Maximum cumulative image wire base64 characters allowed in active context (supports `16MB`, `20MB`, `8MB`, etc.). |
 | **Max Cache Files** | `100` | — | Maximum files kept in the FIFO rolling buffer before oldest are deleted. |
 | **Cache Directory** | `~/.cache/opencode/recent-images` | — | Location where pruned / ephemeral screenshots are backed up. |
 
@@ -111,7 +111,7 @@ npm install -g opencode-prune-images
 ```bash
 # Set custom image count and payload byte limit
 export OPENCODE_MAX_IMAGES=5
-export OPENCODE_MAX_IMAGE_BYTES=4MB
+export OPENCODE_MAX_IMAGE_BYTES=16MB
 ```
 
 ### Programmatic API

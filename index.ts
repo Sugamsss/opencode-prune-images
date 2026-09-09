@@ -35,7 +35,7 @@ import * as os from "node:os";
 import * as crypto from "node:crypto";
 
 export const DEFAULT_MAX_IMAGES_IN_CONTEXT = 7;
-export const DEFAULT_MAX_IMAGE_BYTES = 4 * 1024 * 1024; // 4 MiB wire Base64 limit
+export const DEFAULT_MAX_IMAGE_BYTES = 16 * 1024 * 1024; // 16 MiB wire base64 length (~12 MiB raw binary)
 export const DEFAULT_MAX_CACHE_FILES = 100;
 
 export const DEFAULT_CACHE_DIR = path.join(

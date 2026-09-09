@@ -42,9 +42,9 @@ test("exports standard defaults and getters/setters", () => {
   expect(MAX_IMAGES_IN_CONTEXT).toBe(7);
   expect(getMaxImages()).toBe(7);
 
-  expect(DEFAULT_MAX_IMAGE_BYTES).toBe(4 * 1024 * 1024);
-  expect(MAX_IMAGE_BYTES).toBe(4 * 1024 * 1024);
-  expect(getMaxImageBytes()).toBe(4 * 1024 * 1024);
+  expect(DEFAULT_MAX_IMAGE_BYTES).toBe(16 * 1024 * 1024);
+  expect(MAX_IMAGE_BYTES).toBe(16 * 1024 * 1024);
+  expect(getMaxImageBytes()).toBe(16 * 1024 * 1024);
 
   setMaxImages(4);
   expect(getMaxImages()).toBe(4);
@@ -328,15 +328,15 @@ test("dual-budget cap: prunes older images exceeding maxBytes even when count is
   expect(messages[2].parts[3].type).toBe("image");
 });
 
-test("enforces 4MB (4,194,304 bytes) wire base64 default budget", () => {
-  // 3 images of 1.8MB wire base64 length each (total ~5.4MB)
-  // With DEFAULT_MAX_IMAGE_BYTES (4MB) and maxImages (7):
-  // Should keep 2 newest (2 * 1.8MB = 3.6MB <= 4MB) and prune oldest 1 (1.8MB)
-  const chunk1_8MB = "B".repeat(1_800_000);
+test("enforces 16MB (16,777,216 bytes) wire base64 default budget", () => {
+  // 3 images of 7MB wire base64 length each (total ~21MB)
+  // With DEFAULT_MAX_IMAGE_BYTES (16MB) and maxImages (7):
+  // Should keep 2 newest (2 * 7MB = 14MB <= 16MB) and prune oldest 1 (7MB)
+  const chunk7MB = "B".repeat(7_000_000);
   const makeWireImg = (id: number) => ({
     type: "image",
     filename: `wire-frame-${id}.png`,
-    data: `data:image/png;base64,${chunk1_8MB}`,
+    data: `data:image/png;base64,${chunk7MB}`,
   });
 
   const messages = [
@@ -354,7 +354,7 @@ test("enforces 4MB (4,194,304 bytes) wire base64 default budget", () => {
     },
   ];
 
-  // Run with default budget (maxImages = 7, maxBytes = 4MB)
+  // Run with default budget (maxImages = 7, maxBytes = 16MB)
   const pruned = pruneImages({ messages });
   expect(pruned).toBe(1);
 
