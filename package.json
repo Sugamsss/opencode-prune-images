@@ -1,0 +1,21 @@
+{
+  "name": "opencode-prune-images",
+  "version": "1.0.0",
+  "description": "Auto-caps active image payloads in OpenCode context to prevent 413 and too-many-images errors while preserving natural recall.",
+  "main": "index.ts",
+  "type": "module",
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "ai",
+    "images",
+    "pruning",
+    "context-management"
+  ],
+  "author": "Sugam",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Sugamsss/opencode-prune-images"
+  }
+}
