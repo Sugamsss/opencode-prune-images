@@ -1,12 +1,13 @@
 /**
  * OpenCode Plugin: Intelligent Image Context Manager & Rolling Buffer
  *
- * Prevents 413 "Request Entity Too Large" and "Too many images" errors by
- * capping active visual images sent to LLMs while preserving full conversational
- * recall through contextual text cards and a persistent FIFO disk buffer.
+ * Reduces the chance of 413 "Request Entity Too Large" and "Too many images"
+ * errors by capping active visual images sent to LLMs while preserving a
+ * recoverable summary through contextual text cards and a persistent FIFO disk
+ * buffer. Provider limits and the rest of the request are outside this plugin.
  *
  * 1. Rolling Disk Buffer (~/.cache/opencode/recent-images/):
- *    - Strict FIFO limit of 100 images (configurable).
+ *    - Strict FIFO limit of 100 files.
  *    - Persists pasted base64 data and copies ephemeral (/tmp) screenshots.
  *    - Safe, synchronous, zero-dependency filesystem operations.
  *
@@ -19,14 +20,14 @@
  *
  * 3. Dual-Budget Active Window:
  *    - Preserves up to 7 latest raw images (configurable via OPENCODE_MAX_IMAGES or setMaxImages)
- *      AND up to 4MB active payload bytes (configurable via OPENCODE_MAX_IMAGE_BYTES or setMaxImageBytes).
+ *      AND up to 16 MiB active payload bytes (configurable via OPENCODE_MAX_IMAGE_BYTES or setMaxImageBytes).
  *    - In-place mutation preserving tool call IDs, wrappers, and message structure.
  *
  * 4. Compaction Lifecycle Defense (Zero-Media Strip):
  *    - When event.agent === "compaction" or on /compact requests, effectiveMaxImages and effectiveMaxBytes
  *      are clamped to 0.
  *    - 100% of images are cleanly converted into 3-point context cards with zero raw base64 sent to the model,
- *      preventing 413 compaction failures (issue #14562).
+ *      so compaction receives text cards instead of raw image data (issue #14562).
  */
 
 import * as fs from "node:fs";
@@ -654,11 +655,10 @@ function cleanAndTruncate(text: string, maxLen = 180): string {
 /**
  * Estimate wire base64 character payload length of an image.
  *
- * Requirements:
- * - Alibaba / Qwen and AWS Lambda proxies cap request bodies at 6.0 MiB.
- * - Base64 expands binary by 33% (4 chars per 3 bytes).
- * - System prompts, tools, and conversation text consume 500KB - 1.5MB.
- * - Wire base64 character length directly reflects HTTP payload size over the wire.
+ * Base64 expands binary by 33% (4 chars per 3 bytes), so wire length is a useful
+ * estimate for image payloads. It is not a complete request-size calculation:
+ * prompts, tools, serialization, provider limits, and URL/file estimates are
+ * outside this helper.
  *
  * - Base64 string / data URI: data.length (wire characters)
  * - File on disk: Math.ceil((stat.size * 4) / 3) (wire base64 characters when serialized)
@@ -1058,8 +1058,8 @@ function collectImageRefs(messages: unknown[], target: ImageRef[]): void {
  * OpenCode compaction lifecycle:
  * - Either automatic or manual (/compact), OpenCode triggers context hooks with event.agent === "compaction".
  * - Or the last user message requests a compaction/summary.
- * - The compaction model only produces a text summary (e.g. ## Objective, ## Completed Work).
- * - Passing any raw base64 images into compaction causes 413 payload errors (OpenCode issue #14562).
+ * - Compaction should receive a text summary rather than raw image data.
+ * - Passing raw base64 images into compaction can cause payload errors (OpenCode issue #14562).
  */
 export function isCompactionEvent(event: unknown, messages?: unknown[]): boolean {
   if (!event || typeof event !== "object") return false;
@@ -1108,8 +1108,8 @@ export function isCompactionEvent(event: unknown, messages?: unknown[]): boolean
  * Pruned images are transformed in chronological order (oldest to newest).
  *
  * If event.agent === "compaction" or compaction is requested, effectiveMaxImages
- * and effectiveMaxBytes are clamped to 0 so 100% of images are converted to 3-point
- * context cards with zero raw base64 remaining in context.
+ * and effectiveMaxBytes are clamped to 0 so 100% of recognized images are
+ * converted to 3-point context cards with zero raw image data remaining in context.
  */
 export function pruneImages(
   event: unknown,

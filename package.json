@@ -1,8 +1,9 @@
 {
   "name": "opencode-prune-images",
   "version": "1.2.0",
-  "description": "Dual-budget context manager & rolling buffer for OpenCode. Prevents 413 payload and image-count errors while preserving causal recall.",
+  "description": "Source-only OpenCode plugin that bounds image count and payload size while preserving causal recall cards.",
   "main": "index.ts",
+  "private": true,
   "type": "module",
   "scripts": {
     "test": "bun test",

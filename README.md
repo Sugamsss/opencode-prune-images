@@ -1,171 +1,173 @@
 # opencode-prune-images
 
-Keep OpenCode chats fast, responsive, and crash-free with dual-budget context management and causal semantic anchoring.
+An OpenCode plugin that keeps image-heavy chats manageable.
 
-When agent workflows use browser tools (Playwright, Chrome DevTools, computer-use, or visual verification loops), sessions quickly accumulate dozens of base64 screenshots. Upstream providers and gateways reject requests with fatal errors:
+Browser work, screenshots, and visual checks can add many image attachments to
+one conversation. Large requests may hit a provider or gateway limit. This
+plugin changes the outgoing context before it is sent: it keeps the newest
+images within two budgets and replaces older images with small recall cards.
 
-- `413 Request Entity Too Large` (request body caps on Cloudflare, Qwen, Azure OpenAI, etc.)
-- `Request contains too many images` (Console Go > 50 images, Anthropic > 20 without resizing)
-- Provider token exhaustion and latency degradation
+It is deliberately conservative about what it promises. It reduces image
+payload pressure, but it cannot guarantee that every provider accepts every
+request. Provider limits, prompt size, tool schemas, and other request data
+still matter.
 
-Once that happens, the session gets wedged because the bulky images remain in conversation history. `opencode-prune-images` intercepts the dispatch context in-memory, enforces a **dual-budget constraint (Count + Payload Bytes)**, links images to their **causal user intent and model findings**, summarizes older images into structured 3-point recall cards, and persists captures to a rolling local FIFO disk buffer.
+## What it does
 
----
+- Keeps up to **7 newest images** in the active context by default.
+- Keeps their estimated cumulative wire Base64 payload under **16 MiB** by
+  default (`16,777,216` bytes).
+- Allocates the budgets from newest to oldest. A large recent image can cause
+  older images to become cards even when there are fewer than seven images.
+- Replaces pruned images with a three-point card containing the cached path,
+  what was visible, why it was captured, and a best-effort way to recall it.
+- Copies pasted data and ephemeral `/tmp` captures into a rolling cache with a
+  default cap of **100 files**.
+- Removes recognized image data from the outgoing context during compaction,
+  leaving text cards for the compaction model.
+- Avoids double-wrapping cards that it has already created.
 
-## Architecture & Flow
+The transformation is **outgoing-context only**. It runs in memory in the
+OpenCode context/message hook. It does not rewrite the conversation transcript
+or delete image rows from OpenCode's SQLite history. The cache is also not a
+permanent archive: its oldest files are removed when the 100-file cap is
+exceeded.
 
+## How it works
+
+```text
+[Screenshot or image attachment]
+                |
+                v
+[OpenCode context/message hook]
+                |
+                v
+  Scan recognized image parts
+  Estimate wire Base64 size
+  Keep newest images within:
+    - 7 images
+    - 16 MiB cumulative wire Base64
+                |
+       +--------+--------+
+       |                 |
+       v                 v
+  Keep raw image       Create text card
+  in outgoing context  and cache when possible
+                |
+                v
+        [Provider request]
 ```
-[Agent Browser / Screenshot Tools]
-                │
-                ▼ (raw base64 / /tmp/ captures)
-[OpenCode In-Memory Context]
-                │
-                ▼ (experimental.chat.messages.transform / context hook)
-┌───────────────────────────────────────────────────────────┐
-│                 opencode-prune-images                     │
-│                                                           │
-│  1. Scan all images and estimate wire base64 character size │
-│  2. Greedy Dual-Budget Allocation (Newest to Oldest):     │
-│     • Count Budget: Keep <= MAX_IMAGES (default: 7)       │
-│     • Byte Budget: Keep <= MAX_IMAGE_BYTES (default: 4MB) │
-│  3. Compaction Hook Guard (Zero Media):                   │
-│     • If event.agent === "compaction" or /compact command:│
-│       Set effective budget to 0 images, 0 bytes           │
-│  4. For images exceeding either budget:                   │
-│     • Persist ephemeral captures to rolling FIFO cache    │
-│     • Causal Context Extraction (User Intent + Finding)   │
-│     • Convert into 3-point Markdown context cards         │
-│     • Keep newest images intact in full visual fidelity   │
-└─────────────────────────────┬─────────────────────────────┘
-                              │
-                              ▼ (clean payload, zero 413s)
-                 [Upstream Model Provider]
-       (OpenAI • Anthropic • Google Gemini • 9Router)
+
+The plugin supports OpenCode's preview `context` hook and the
+`experimental.chat.messages.transform` hook when available.
+
+## Recall cards
+
+A card looks like this:
+
+```text
+[Pruned Image: /Users/username/.cache/opencode/recent-images/img_3f8a91b2.png]
+• What's visible: Found a 12px alignment issue around the checkout button.
+• Why it was captured: Check UI alignment on the checkout button.
+• Recall: Read the cached path if it still exists, or re-capture the screen.
 ```
 
-### What Happens to Pruned Images?
-
-Pruned images are replaced in-memory with a structured 3-point context card:
-
-```markdown
-[Pruned Image: /Users/username/.cache/opencode/recent-images/img_3f8a91b2c4e5f607.png]
-• What's visible: Found 12px alignment issue where button padding is overflowing container bounds. (checkout-button.png)
-• Why it was captured: Check UI alignment on the checkout button
-• Recall: If needed again, read from `/Users/username/.cache/opencode/recent-images/img_3f8a91b2c4e5f607.png`. If missing, rely on the summary above—or if safe to reproduce, re-capture the screen.
-```
-
-- **Dual-Budget Protection (16MB Wire Limit)**: Constrains both image count (default 7) and cumulative wire base64 payload size (default 16MB / 16,777,216 bytes). Matches OpenCode 2's native 5MB per-image normalization standard and accommodates full-resolution multi-screenshot visual verification loops while staying safely under the 20MB–50MB payload ceilings of modern LLM providers (Bedrock, Gemini, OpenAI, Claude).
-- **Compaction Lifecycle Defense (Zero-Media Strip)**: When OpenCode runs compaction (`event.agent === "compaction"` or `/compact`), the model only outputs a text summary. Sending raw base64 into compaction causes recursive 413 bricking (OpenCode issue #14562). The plugin strips 100% of images to 3-point cards during compaction so the model synthesizes findings purely from text summaries.
-- **Causal Semantic Anchoring**: In complex multi-turn tool loops (`user -> tool(bash) -> tool(read image) -> tool(grep) -> assistant("Found bug...")`), the synthesizer crawls backwards to isolate the originating user prompt and forward up to 6 turns to capture the assistant's visual findings, skipping boilerplate tool output like "Image read successfully".
-- **Defensive & Non-Destructive**: Never double-wraps existing cards or markers. Transformations happen purely in-memory right before provider dispatch; your persisted SQLite session history is untouched.
-- **Persistent Rolling Buffer**: Base64 payloads and ephemeral `/tmp` screenshots are copied to `~/.cache/opencode/recent-images/` with a strict FIFO cap (default 100 files).
-- **Zero Runtime Dependencies**: Written in pure TypeScript using native Node.js / Bun standard library modules (`node:fs`, `node:path`, `node:crypto`, `node:os`).
-
----
+Cards are intentionally lossy. They provide a useful summary and a best-effort
+cached path; they do not preserve the original pixels. Caching can fail for a
+restricted or missing file, and cached files can later be evicted.
 
 ## Installation
 
-### Method 1: OpenCode Plugin List (Recommended)
+This repository is **source-only and is not published to npm**. Do not use
+`npm install -g opencode-prune-images` yet.
 
-Add `opencode-prune-images` directly to your `~/.config/opencode/opencode.json` or project-level `opencode.json`:
-
-```json
-{
-  "plugin": [
-    "opencode-prune-images"
-  ]
-}
-```
-
-Or reference a local clone / file:
-
-```json
-{
-  "plugin": [
-    "file:///Users/username/.config/opencode/plugins/prune-images.ts"
-  ]
-}
-```
-
-### Method 2: Global Install
+Clone or copy the source file, then point OpenCode at its absolute `file:` URL:
 
 ```bash
-npm install -g opencode-prune-images
+mkdir -p ~/.config/opencode/plugins
+git clone https://github.com/Sugamsss/opencode-prune-images.git \
+  ~/.config/opencode/plugins/opencode-prune-images
 ```
 
----
+Add this to `~/.config/opencode/opencode.json` or to a project-level config:
+
+```json
+{
+  "plugin": [
+    "file:///Users/username/.config/opencode/plugins/opencode-prune-images/index.ts"
+  ]
+}
+```
+
+Use the real absolute path for your machine. Keep the repository in place while
+OpenCode loads it. Restart OpenCode after changing the plugin configuration.
 
 ## Configuration
 
-`opencode-prune-images` works out of the box with safe, production-tested defaults:
+Environment values are read when the module initializes. Restart OpenCode after
+changing them. The exported setters change the value only in the current
+process.
 
-| Setting | Default | Environment Variable | Description |
-| :--- | :--- | :--- | :--- |
-| **Max Images in Context** | `7` | `OPENCODE_MAX_IMAGES` | Maximum number of recent images preserved in full resolution sent to the model. |
-| **Max Image Payload Bytes** | `16777216` (16 MB) | `OPENCODE_MAX_IMAGE_BYTES` | Maximum cumulative image wire base64 characters allowed in active context (supports `16MB`, `20MB`, `8MB`, etc.). |
-| **Max Cache Files** | `100` | — | Maximum files kept in the FIFO rolling buffer before oldest are deleted. |
-| **Cache Directory** | `~/.cache/opencode/recent-images` | — | Location where pruned / ephemeral screenshots are backed up. |
+| Setting | Default | Environment variable | Notes |
+| --- | ---: | --- | --- |
+| Active image count | `7` | `OPENCODE_MAX_IMAGES` | Newest images win. Positive integers only. |
+| Active image bytes | `16 MiB` (`16,777,216`) | `OPENCODE_MAX_IMAGE_BYTES` | Cumulative estimated wire Base64 size. |
+| Rolling cache files | `100` | — | Fixed default cap. `enforceCacheCap()` accepts an explicit cap for programmatic use. |
+| Rolling cache directory | `~/.cache/opencode/recent-images` | — | Can be changed with `setCacheDir()`. |
 
-### Example: Environment Configuration
+The byte parser accepts values such as `500KB`, `16MB`, `16MiB`, and raw byte
+counts. In this plugin, `KB`/`MB` use binary units (`1024` and `1024 * 1024`).
+
+Example:
 
 ```bash
-# Set custom image count and payload byte limit
 export OPENCODE_MAX_IMAGES=5
-export OPENCODE_MAX_IMAGE_BYTES=16MB
+export OPENCODE_MAX_IMAGE_BYTES=16MiB
 ```
 
-### Programmatic API
+The source also exports `setMaxImages`, `setMaxImageBytes`, `setCacheDir`, and
+`pruneImages` for local wrappers and tests. The package is marked private because
+there is no supported npm distribution yet.
 
-If importing or wrapping the plugin in your own setup:
+## Limits and safety notes
 
-```typescript
-import {
-  setMaxImages,
-  setMaxImageBytes,
-  setCacheDir,
-  pruneImages
-} from "opencode-prune-images";
+- The 16 MiB budget covers the plugin's estimated image payload, not the full
+  HTTP request. It is not a guarantee against 413 responses.
+- Inline Base64/data URIs are measured from their Base64 content. Local files
+  are estimated from their size. Remote URLs use a nominal estimate.
+- The plugin does not transcode or resize images.
+- It does not delete original project files. Only files in the rolling cache
+  are subject to the cache cap.
+- The plugin does not inspect or clean OpenCode's SQLite database. If an old
+  conversation itself is too large, use OpenCode's supported history controls
+  or handle database cleanup separately and carefully.
+- Compaction receives text cards because the plugin sets the active image and
+  byte budgets to zero for recognized images. The plugin does not control the
+  summary text that the model writes.
 
-// Set custom count and byte limits
-setMaxImages(5);
-setMaxImageBytes(4 * 1024 * 1024); // 4MB
+## Development
 
-// Set custom cache location
-setCacheDir("/path/to/custom/cache");
-```
-
----
-
-## Troubleshooting & FAQ
-
-#### Why a dual budget (count + bytes)?
-Vision models and cloud reverse proxies enforce independent bottlenecks:
-1. Model providers reject queries with too many image parts (e.g. 20-50 images max).
-2. Reverse proxies and serverless gateways (Cloudflare, Azure, AWS API Gateway) reject requests exceeding body size limits (e.g. 6MB to 32MB HTTP payloads).
-A dual-budget guarantees that neither limit will ever be exceeded.
-
-#### Does this delete my screenshots from disk?
-No. Original screenshots in project directories are never touched. Only the rolling cache directory (`~/.cache/opencode/recent-images/`) enforces a FIFO cap (default 100 items) to prevent disk bloat over months of automated work.
-
-#### What happens if the agent needs to see an image that was pruned?
-The card provides the exact file path to the cached image. The agent can use any file-reading or image-reading tool (such as `read` or browser inspection) to reload it into active context.
-
-#### Does this break tool call IDs or subagent structures?
-No. The plugin performs in-place replacement on content parts while preserving `id`, `tool`, `toolName`, and surrounding metadata intact.
-
----
-
-## Development & Verification
+Requires Bun and TypeScript.
 
 ```bash
-# Run test suite
+bun install
 bun test
-
-# Typecheck with strict TypeScript
 bun run typecheck
 ```
 
----
+The test suite covers normal and malformed inputs, nested tool results, image
+count and byte budgets, cache rotation, compaction behavior, duplicate cards,
+and plugin hook registration.
+
+## Known limitations
+
+- Image recognition depends on the attachment shapes exposed by OpenCode. An
+  unknown future media shape may pass through untouched.
+- The causal card summary is based on nearby conversation text. It cannot see
+  pixels after an image has been pruned.
+- The rolling cache is local to one machine and is not synced between devices.
+- The plugin has been tested with synthetic fixtures. Provider-specific request
+  limits and deployed OpenCode clients still need independent verification.
 
 ## License
 
