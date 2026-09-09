@@ -42,9 +42,9 @@ test("exports standard defaults and getters/setters", () => {
   expect(MAX_IMAGES_IN_CONTEXT).toBe(7);
   expect(getMaxImages()).toBe(7);
 
-  expect(DEFAULT_MAX_IMAGE_BYTES).toBe(8 * 1024 * 1024);
-  expect(MAX_IMAGE_BYTES).toBe(8 * 1024 * 1024);
-  expect(getMaxImageBytes()).toBe(8 * 1024 * 1024);
+  expect(DEFAULT_MAX_IMAGE_BYTES).toBe(4 * 1024 * 1024);
+  expect(MAX_IMAGE_BYTES).toBe(4 * 1024 * 1024);
+  expect(getMaxImageBytes()).toBe(4 * 1024 * 1024);
 
   setMaxImages(4);
   expect(getMaxImages()).toBe(4);
@@ -58,15 +58,16 @@ test("exports standard defaults and getters/setters", () => {
   setMaxImages(7);
   expect(getMaxImages()).toBe(7);
 
-  setMaxImageBytes(6 * 1024 * 1024);
-  expect(getMaxImageBytes()).toBe(6 * 1024 * 1024);
+  setMaxImageBytes(3 * 1024 * 1024);
+  expect(getMaxImageBytes()).toBe(3 * 1024 * 1024);
   setMaxImageBytes(-100);
-  expect(getMaxImageBytes()).toBe(6 * 1024 * 1024);
+  expect(getMaxImageBytes()).toBe(3 * 1024 * 1024);
   setMaxImageBytes(Number.NaN);
-  expect(getMaxImageBytes()).toBe(6 * 1024 * 1024);
-  setMaxImageBytes(8 * 1024 * 1024);
-  expect(getMaxImageBytes()).toBe(8 * 1024 * 1024);
+  expect(getMaxImageBytes()).toBe(3 * 1024 * 1024);
+  setMaxImageBytes(4 * 1024 * 1024);
+  expect(getMaxImageBytes()).toBe(4 * 1024 * 1024);
 
+  expect(parseByteString("4MB")).toBe(4 * 1024 * 1024);
   expect(parseByteString("8MB")).toBe(8 * 1024 * 1024);
   expect(parseByteString("64kb")).toBe(64 * 1024);
   expect(parseByteString("1048576")).toBe(1048576);
@@ -325,6 +326,143 @@ test("dual-budget cap: prunes older images exceeding maxBytes even when count is
   // Frames 3 and 4 (newest) kept intact
   expect(messages[2].parts[1].type).toBe("image");
   expect(messages[2].parts[3].type).toBe("image");
+});
+
+test("enforces 4MB (4,194,304 bytes) wire base64 default budget", () => {
+  // 3 images of 1.8MB wire base64 length each (total ~5.4MB)
+  // With DEFAULT_MAX_IMAGE_BYTES (4MB) and maxImages (7):
+  // Should keep 2 newest (2 * 1.8MB = 3.6MB <= 4MB) and prune oldest 1 (1.8MB)
+  const chunk1_8MB = "B".repeat(1_800_000);
+  const makeWireImg = (id: number) => ({
+    type: "image",
+    filename: `wire-frame-${id}.png`,
+    data: `data:image/png;base64,${chunk1_8MB}`,
+  });
+
+  const messages = [
+    {
+      role: "user",
+      content: "Inspect wire frames",
+      parts: [
+        { type: "text", text: "Wire 1" },
+        makeWireImg(1),
+        { type: "text", text: "Wire 2" },
+        makeWireImg(2),
+        { type: "text", text: "Wire 3" },
+        makeWireImg(3),
+      ],
+    },
+  ];
+
+  // Run with default budget (maxImages = 7, maxBytes = 4MB)
+  const pruned = pruneImages({ messages });
+  expect(pruned).toBe(1);
+
+  // Wire 1 (oldest) pruned to 3-point card
+  expect(messages[0].parts[1].type).toBe("text");
+  expect((messages[0].parts[1] as { text?: string }).text).toContain("[Pruned Image:");
+  expect((messages[0].parts[1] as { text?: string }).text).toContain("wire-frame-1.png");
+
+  // Wire 2 and Wire 3 remain intact
+  expect(messages[0].parts[3].type).toBe("image");
+  expect(messages[0].parts[5].type).toBe("image");
+});
+
+test("compaction lifecycle: strips 100% of images to 3-point cards when event.agent === 'compaction'", () => {
+  const messages = [
+    {
+      role: "user",
+      content: "Please check design and alignment",
+      parts: [
+        { type: "text", text: "Initial mockup" },
+        {
+          type: "image",
+          filename: "mockup-desktop.png",
+          data: "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==",
+        },
+      ],
+    },
+    {
+      role: "assistant",
+      content: "I reviewed mockup-desktop.png and verified 16px margins.",
+    },
+    {
+      role: "user",
+      content: "Here is mobile view",
+      parts: [
+        { type: "text", text: "Mobile mockup" },
+        {
+          type: "image",
+          filename: "mockup-mobile.png",
+          data: "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==",
+        },
+      ],
+    },
+  ];
+
+  // Dispatch compaction event
+  const event = {
+    agent: "compaction",
+    messages,
+  };
+
+  const pruned = pruneImages(event);
+  // 100% of images (both 1 and 2) must be pruned to 3-point cards
+  expect(pruned).toBe(2);
+
+  // First image -> 3-point card
+  expect(messages[0].parts[1].type).toBe("text");
+  const card1 = (messages[0].parts[1] as { text?: string }).text || "";
+  expect(card1).toContain("[Pruned Image:");
+  expect(card1).toContain("mockup-desktop.png");
+  expect(card1).not.toContain("data:image/");
+
+  // Second image -> 3-point card
+  expect(messages[2].parts[1].type).toBe("text");
+  const card2 = (messages[2].parts[1] as { text?: string }).text || "";
+  expect(card2).toContain("[Pruned Image:");
+  expect(card2).toContain("mockup-mobile.png");
+  expect(card2).not.toContain("data:image/");
+
+  // Zero raw base64 or image parts remain in messages
+  for (const msg of messages) {
+    if (Array.isArray(msg.parts)) {
+      for (const part of msg.parts) {
+        expect((part as { type?: string }).type).not.toBe("image");
+        expect((part as { data?: string }).data).toBeUndefined();
+      }
+    }
+  }
+});
+
+test("compaction lifecycle: strips 100% of images when last message is /compact", () => {
+  const messages = [
+    {
+      role: "user",
+      content: "Initial visual check",
+      parts: [
+        {
+          type: "image",
+          filename: "view.png",
+          data: "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==",
+        },
+      ],
+    },
+    {
+      role: "assistant",
+      content: "Observed view.",
+    },
+    {
+      role: "user",
+      content: "/compact",
+    },
+  ];
+
+  const pruned = pruneImages({ messages });
+  expect(pruned).toBe(1);
+  expect(messages[0].parts[0].type).toBe("text");
+  expect((messages[0].parts[0] as { text?: string }).text).toContain("[Pruned Image:");
+  expect((messages[0].parts[0] as { text?: string }).text).not.toContain("data:image/");
 });
 
 test("causal chain context extraction across multi-step tool loops", () => {

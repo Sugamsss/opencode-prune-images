@@ -24,11 +24,14 @@ Once that happens, the session gets wedged because the bulky images remain in co
 ┌───────────────────────────────────────────────────────────┐
 │                 opencode-prune-images                     │
 │                                                           │
-│  1. Scan all images and estimate payload byte size        │
+│  1. Scan all images and estimate wire base64 character size │
 │  2. Greedy Dual-Budget Allocation (Newest to Oldest):     │
 │     • Count Budget: Keep <= MAX_IMAGES (default: 7)       │
-│     • Byte Budget: Keep <= MAX_IMAGE_BYTES (default: 8MB) │
-│  3. For images exceeding either budget:                   │
+│     • Byte Budget: Keep <= MAX_IMAGE_BYTES (default: 4MB) │
+│  3. Compaction Hook Guard (Zero Media):                   │
+│     • If event.agent === "compaction" or /compact command:│
+│       Set effective budget to 0 images, 0 bytes           │
+│  4. For images exceeding either budget:                   │
 │     • Persist ephemeral captures to rolling FIFO cache    │
 │     • Causal Context Extraction (User Intent + Finding)   │
 │     • Convert into 3-point Markdown context cards         │
@@ -51,7 +54,8 @@ Pruned images are replaced in-memory with a structured 3-point context card:
 • Recall: If needed again, read from `/Users/username/.cache/opencode/recent-images/img_3f8a91b2c4e5f607.png`. If missing, rely on the summary above—or if safe to reproduce, re-capture the screen.
 ```
 
-- **Dual-Budget Protection**: Constrains both image count (default 7) and cumulative payload size (default 8MB). Even if you have only 3 large retina 4K screenshots (e.g. 15MB), the byte-budget prunes older frames to keep the request safely under gateway 413 limits.
+- **Dual-Budget Protection (Golden 4MB Safe Limit)**: Constrains both image count (default 7) and cumulative wire base64 payload size (default 4MB / 4,194,304 bytes). Providers and gateways like Alibaba/Qwen and AWS Lambda enforce a hard 6.0 MiB ceiling for the entire request; Base64 expansion adds 33% and text context adds 0.5–1.5MB. The 4MB wire limit leaves a reliable 2MB safety margin for zero 413s across all upstream proxies.
+- **Compaction Lifecycle Defense (Zero-Media Strip)**: When OpenCode runs compaction (`event.agent === "compaction"` or `/compact`), the model only outputs a text summary. Sending raw base64 into compaction causes recursive 413 bricking (OpenCode issue #14562). The plugin strips 100% of images to 3-point cards during compaction so the model synthesizes findings purely from text summaries.
 - **Causal Semantic Anchoring**: In complex multi-turn tool loops (`user -> tool(bash) -> tool(read image) -> tool(grep) -> assistant("Found bug...")`), the synthesizer crawls backwards to isolate the originating user prompt and forward up to 6 turns to capture the assistant's visual findings, skipping boilerplate tool output like "Image read successfully".
 - **Defensive & Non-Destructive**: Never double-wraps existing cards or markers. Transformations happen purely in-memory right before provider dispatch; your persisted SQLite session history is untouched.
 - **Persistent Rolling Buffer**: Base64 payloads and ephemeral `/tmp` screenshots are copied to `~/.cache/opencode/recent-images/` with a strict FIFO cap (default 100 files).
@@ -98,7 +102,7 @@ npm install -g opencode-prune-images
 | Setting | Default | Environment Variable | Description |
 | :--- | :--- | :--- | :--- |
 | **Max Images in Context** | `7` | `OPENCODE_MAX_IMAGES` | Maximum number of recent images preserved in full resolution sent to the model. |
-| **Max Image Payload Bytes** | `8388608` (8 MB) | `OPENCODE_MAX_IMAGE_BYTES` | Maximum cumulative image byte size allowed in active context (supports `8MB`, `6MB`, `500KB`, etc.). |
+| **Max Image Payload Bytes** | `4194304` (4 MB) | `OPENCODE_MAX_IMAGE_BYTES` | Maximum cumulative image wire base64 characters allowed in active context (supports `4MB`, `6MB`, `500KB`, etc.). |
 | **Max Cache Files** | `100` | — | Maximum files kept in the FIFO rolling buffer before oldest are deleted. |
 | **Cache Directory** | `~/.cache/opencode/recent-images` | — | Location where pruned / ephemeral screenshots are backed up. |
 
@@ -107,7 +111,7 @@ npm install -g opencode-prune-images
 ```bash
 # Set custom image count and payload byte limit
 export OPENCODE_MAX_IMAGES=5
-export OPENCODE_MAX_IMAGE_BYTES=6MB
+export OPENCODE_MAX_IMAGE_BYTES=4MB
 ```
 
 ### Programmatic API
@@ -124,7 +128,7 @@ import {
 
 // Set custom count and byte limits
 setMaxImages(5);
-setMaxImageBytes(6 * 1024 * 1024); // 6MB
+setMaxImageBytes(4 * 1024 * 1024); // 4MB
 
 // Set custom cache location
 setCacheDir("/path/to/custom/cache");

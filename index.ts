@@ -19,8 +19,14 @@
  *
  * 3. Dual-Budget Active Window:
  *    - Preserves up to 7 latest raw images (configurable via OPENCODE_MAX_IMAGES or setMaxImages)
- *      AND up to 8MB active payload bytes (configurable via OPENCODE_MAX_IMAGE_BYTES or setMaxImageBytes).
+ *      AND up to 4MB active payload bytes (configurable via OPENCODE_MAX_IMAGE_BYTES or setMaxImageBytes).
  *    - In-place mutation preserving tool call IDs, wrappers, and message structure.
+ *
+ * 4. Compaction Lifecycle Defense (Zero-Media Strip):
+ *    - When event.agent === "compaction" or on /compact requests, effectiveMaxImages and effectiveMaxBytes
+ *      are clamped to 0.
+ *    - 100% of images are cleanly converted into 3-point context cards with zero raw base64 sent to the model,
+ *      preventing 413 compaction failures (issue #14562).
  */
 
 import * as fs from "node:fs";
@@ -29,7 +35,7 @@ import * as os from "node:os";
 import * as crypto from "node:crypto";
 
 export const DEFAULT_MAX_IMAGES_IN_CONTEXT = 7;
-export const DEFAULT_MAX_IMAGE_BYTES = 8 * 1024 * 1024; // 8 MB
+export const DEFAULT_MAX_IMAGE_BYTES = 4 * 1024 * 1024; // 4 MiB wire Base64 limit
 export const DEFAULT_MAX_CACHE_FILES = 100;
 
 export const DEFAULT_CACHE_DIR = path.join(
@@ -646,10 +652,17 @@ function cleanAndTruncate(text: string, maxLen = 180): string {
 }
 
 /**
- * Estimate byte payload size of an image.
- * - Base64 string / data URI: data.length (or binary equivalent (data.length * 3) / 4)
- * - File on disk: fs.statSync().size or Buffer size
- * - Remote URL: small nominal estimate (500KB)
+ * Estimate wire base64 character payload length of an image.
+ *
+ * Requirements:
+ * - Alibaba / Qwen and AWS Lambda proxies cap request bodies at 6.0 MiB.
+ * - Base64 expands binary by 33% (4 chars per 3 bytes).
+ * - System prompts, tools, and conversation text consume 500KB - 1.5MB.
+ * - Wire base64 character length directly reflects HTTP payload size over the wire.
+ *
+ * - Base64 string / data URI: data.length (wire characters)
+ * - File on disk: Math.ceil((stat.size * 4) / 3) (wire base64 characters when serialized)
+ * - Remote URL: nominal estimate (500KB wire chars)
  */
 export function estimateImageBytes(meta: ImageMeta): number {
   if (meta.byteSize && meta.byteSize > 0) {
@@ -663,7 +676,7 @@ export function estimateImageBytes(meta: ImageMeta): number {
     if (commaIdx !== -1) {
       raw = raw.slice(commaIdx + 1);
     }
-    // Using base64 payload length directly as that represents actual memory/wire serialization size
+    // Wire base64 character length directly reflects serialized request payload
     return raw.length;
   }
 
@@ -675,7 +688,7 @@ export function estimateImageBytes(meta: ImageMeta): number {
       if (fs.existsSync(resolved)) {
         const stat = fs.statSync(resolved);
         if (stat.isFile()) {
-          // Convert binary disk size to approximate base64 payload size (* 4 / 3) for parity
+          // Convert binary disk size to wire base64 character length (* 4 / 3)
           return Math.ceil((stat.size * 4) / 3);
         }
       }
@@ -1040,10 +1053,63 @@ function collectImageRefs(messages: unknown[], target: ImageRef[]): void {
 }
 
 /**
+ * Check if the current context event or message payload indicates compaction.
+ *
+ * OpenCode compaction lifecycle:
+ * - Either automatic or manual (/compact), OpenCode triggers context hooks with event.agent === "compaction".
+ * - Or the last user message requests a compaction/summary.
+ * - The compaction model only produces a text summary (e.g. ## Objective, ## Completed Work).
+ * - Passing any raw base64 images into compaction causes 413 payload errors (OpenCode issue #14562).
+ */
+export function isCompactionEvent(event: unknown, messages?: unknown[]): boolean {
+  if (!event || typeof event !== "object") return false;
+  const ev = event as Record<string, unknown>;
+
+  // 1. Direct event.agent check (OpenCode convention)
+  if (typeof ev.agent === "string" && ev.agent.toLowerCase() === "compaction") {
+    return true;
+  }
+
+  // Also check nested session/context info if present
+  const session = ev.session as Record<string, unknown> | undefined;
+  if (typeof session?.agent === "string" && session.agent.toLowerCase() === "compaction") {
+    return true;
+  }
+
+  // 2. Check last message content / intent for compaction
+  const msgs = messages || (Array.isArray(ev.messages) ? (ev.messages as unknown[]) : null);
+  if (Array.isArray(msgs) && msgs.length > 0) {
+    const lastMsg = msgs[msgs.length - 1] as Record<string, unknown> | undefined;
+    if (lastMsg) {
+      // Check last message role or info
+      const info = lastMsg.info as Record<string, unknown> | undefined;
+      if (typeof info?.agent === "string" && info.agent.toLowerCase() === "compaction") {
+        return true;
+      }
+      const text = extractMessageText(lastMsg).trim().toLowerCase();
+      if (
+        text === "/compact" ||
+        text.startsWith("/compact ") ||
+        text.includes("compact conversation") ||
+        text.includes("summarize conversation history")
+      ) {
+        return true;
+      }
+    }
+  }
+
+  return false;
+}
+
+/**
  * Core Prune Routine:
  * Dual-budget enforcement (Max Images Count + Max Payload Bytes).
  * Allocates budget greedily from newest to oldest images.
  * Pruned images are transformed in chronological order (oldest to newest).
+ *
+ * If event.agent === "compaction" or compaction is requested, effectiveMaxImages
+ * and effectiveMaxBytes are clamped to 0 so 100% of images are converted to 3-point
+ * context cards with zero raw base64 remaining in context.
  */
 export function pruneImages(
   event: unknown,
@@ -1062,6 +1128,11 @@ export function pruneImages(
 
     if (!messages || messages.length === 0) return 0;
 
+    // Compaction detection: strip 100% of media to 3-point context cards
+    const isCompaction = isCompactionEvent(event, messages);
+    const effectiveMaxImages = isCompaction ? 0 : maxImages;
+    const effectiveMaxBytes = isCompaction ? 0 : maxBytes;
+
     const imageRefs: ImageRef[] = [];
     collectImageRefs(messages, imageRefs);
 
@@ -1079,7 +1150,7 @@ export function pruneImages(
       const ref = imageRefs[i];
       const imgBytes = estimateImageBytes(ref.meta);
 
-      if (retainedCount < maxImages && retainedBytes + imgBytes <= maxBytes) {
+      if (retainedCount < effectiveMaxImages && retainedBytes + imgBytes <= effectiveMaxBytes) {
         keepIndices.add(i);
         retainedCount++;
         retainedBytes += imgBytes;
