@@ -22,6 +22,10 @@
  *    - Preserves up to 7 latest raw images (configurable via OPENCODE_MAX_IMAGES or setMaxImages)
  *      AND up to 16 MiB active payload bytes (configurable via OPENCODE_MAX_IMAGE_BYTES or setMaxImageBytes).
  *    - In-place mutation preserving tool call IDs, wrappers, and message structure.
+ *    - V1 tool attachments pruned from state.attachments are removed from the
+ *      array with their card appended to that tool part's output text, since
+ *      neither provider conversion nor the compaction serializer reads card
+ *      text out of a replaced attachment object.
  *
  * 4. Compaction Lifecycle Defense (Zero-Media Strip):
  *    - When event.agent === "compaction" or on /compact requests, effectiveMaxImages and effectiveMaxBytes
@@ -1053,6 +1057,41 @@ function collectImageRefs(messages: unknown[], target: ImageRef[]): void {
 }
 
 /**
+ * Find the V1 tool part that owns a state.attachments array (or an object
+ * inside one) so pruned attachments can be removed cleanly instead of
+ * swapping the attachment object for a text object downstream code cannot
+ * read. Returns the owning part and its attachments array, or undefined when
+ * the container is not a V1 tool attachment holder.
+ */
+function findV1ToolAttachmentOwner(
+  messages: unknown[],
+  messageIndex: number,
+  container: unknown
+): { part: Record<string, unknown>; state: Record<string, unknown>; attachments: unknown[] } | undefined {
+  const msg = messages[messageIndex] as Record<string, unknown> | undefined;
+  if (!msg || typeof msg !== "object") return undefined;
+  const parts = Array.isArray(msg.parts) ? msg.parts : null;
+  if (!parts) return undefined;
+
+  for (const part of parts) {
+    if (!part || typeof part !== "object") continue;
+    const p = part as Record<string, unknown>;
+    if (p.type !== "tool") continue;
+    const state = p.state as Record<string, unknown> | undefined;
+    if (!state || typeof state !== "object") continue;
+    if (state.status !== "completed") continue;
+    const attachments = state.attachments;
+    if (!Array.isArray(attachments)) continue;
+    if (attachments === container) {
+      return { part: p, state, attachments };
+    }
+    if (container && typeof container === "object" && attachments.includes(container)) {
+      return { part: p, state, attachments };
+    }
+  }
+  return undefined;
+}
+/**
  * Check if the current context event or message payload indicates compaction.
  *
  * OpenCode compaction lifecycle:
@@ -1163,6 +1202,14 @@ export function pruneImages(
     }
 
     // 2. Identify references to prune and transform in chronological order (oldest to newest)
+    // V1 tool attachments are collected separately: removing the entry from
+    // state.attachments and appending the card to state.output keeps both the
+    // normal provider conversion and the compaction serializer working, since
+    // neither path reads card text out of a replaced attachment object.
+    const attachmentOps = new Map<
+      Record<string, unknown>,
+      { owner: Record<string, unknown>; state: Record<string, unknown>; attachments: unknown[]; cards: string[]; targets: unknown[] }
+    >();
     let prunedCount = 0;
 
     for (let i = 0; i < imageRefs.length; i++) {
@@ -1193,7 +1240,33 @@ export function pruneImages(
       // c. Format 3-point card
       const cardText = formatThreePointCard(cachedPath, observed, intent);
 
-      // d. In-place replacement preserving wrapper and ID
+      // d1. V1 tool attachment: defer removal so array indices stay valid
+      // until every card for that tool part is collected. Only applies when
+      // the ref points directly at the attachments array or at an object
+      // inside it; anything else falls through to standard replacement so no
+      // image is kept while its card is also added.
+      const owner =
+        ref.type === "part" || ref.type === "raw-string"
+          ? findV1ToolAttachmentOwner(messages, ref.messageIndex, ref.container)
+          : undefined;
+      const ownerArray = owner?.attachments;
+      const isDirectIndex =
+        !!ownerArray && ref.container === ownerArray && typeof ref.keyOrIndex === "number";
+      const isDirectObject =
+        !!ownerArray && ref.container !== ownerArray && ownerArray.includes(ref.container);
+      if (owner && ownerArray && (isDirectIndex || isDirectObject)) {
+        let op = attachmentOps.get(owner.part);
+        if (!op) {
+          op = { owner: owner.part, state: owner.state, attachments: ownerArray, cards: [], targets: [] };
+          attachmentOps.set(owner.part, op);
+        }
+        op.cards.push(cardText);
+        op.targets.push(isDirectIndex ? (ref.keyOrIndex as number) : ref.container);
+        prunedCount++;
+        continue;
+      }
+
+      // d2. In-place replacement preserving wrapper and ID
       const existingObj = existing && typeof existing === "object" ? (existing as Record<string, unknown>) : undefined;
       const existingId = existingObj ? existingObj.id : undefined;
 
@@ -1220,6 +1293,27 @@ export function pruneImages(
       }
 
       prunedCount++;
+    }
+
+    // e. Apply deferred V1 attachment removals: highest index first so array
+    // positions stay valid, then append cards to the tool output text.
+    for (const op of attachmentOps.values()) {
+      const numericTargets = op.targets.filter((t): t is number => typeof t === "number").sort((a, b) => b - a);
+      for (const idx of numericTargets) {
+        if (idx >= 0 && idx < op.attachments.length) {
+          op.attachments.splice(idx, 1);
+        }
+      }
+      // Object targets are attachment objects nested without a direct index:
+      // remove them by identity.
+      for (const target of op.targets) {
+        if (typeof target === "number") continue;
+        const obj = target as unknown;
+        const at = op.attachments.indexOf(obj);
+        if (at !== -1) op.attachments.splice(at, 1);
+      }
+      const prior = typeof op.state.output === "string" ? op.state.output : "";
+      op.state.output = prior ? `${prior}\n\n${op.cards.join("\n\n")}` : op.cards.join("\n\n");
     }
 
     return prunedCount;

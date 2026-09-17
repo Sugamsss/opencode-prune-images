@@ -24,8 +24,14 @@ still matter.
 - Copies pasted data and ephemeral `/tmp` captures into a rolling cache with a
   default cap of **100 files**.
 - Removes recognized image data from the outgoing context during compaction,
-  leaving text cards for the compaction model.
+  leaving text cards for the compaction model. The zero image mode applies
+  when the hook event is explicitly marked as compaction. The V1 compaction
+  transform carries no such marker, so it uses the normal budgets there.
 - Avoids double-wrapping cards that it has already created.
+- Handles V1 tool attachments by removing pruned entries from
+  `state.attachments` and appending their cards to that tool part's output
+  text. This keeps provider conversion and compaction serialization working,
+  since neither path reads card text out of a replaced attachment object.
 
 The transformation is **outgoing-context only**. It runs in memory in the
 OpenCode context/message hook. It does not rewrite the conversation transcript
@@ -59,7 +65,9 @@ exceeded.
 ```
 
 The plugin supports OpenCode's preview `context` hook and the
-`experimental.chat.messages.transform` hook when available.
+`experimental.chat.messages.transform` hook when available. The transform hook
+remains present on current upstream `dev` and fires before provider conversion
+on normal requests and before serialization on the V1 compaction path.
 
 ## Recall cards
 

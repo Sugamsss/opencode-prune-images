@@ -572,3 +572,61 @@ test("plugin structure satisfies OpenCode plugin signature", async () => {
   await plugin.setup(mockCtx);
   expect(hookRegistered).toBe(true);
 });
+
+test("V1 tool attachments prune to output cards without breaking downstream shapes", () => {
+  // Real read-tool shape: type file attachments with data URLs under
+  // state.attachments. Pruned entries must leave the array and land in
+  // state.output, because downstream code reads card text from neither a
+  // replaced attachment object nor a rewritten attachment URL.
+  const tiny = "data:image/png;base64," + "A".repeat(1000);
+  const messages = [
+    { role: "user", content: "check", parts: [{ type: "text", text: "check screenshots" }] },
+    {
+      role: "assistant",
+      content: "",
+      parts: [
+        {
+          type: "tool",
+          id: "p1",
+          tool: "read",
+          callID: "c1",
+          state: {
+            status: "completed",
+            input: { filePath: "/tmp/shot.png" },
+            output: "Image read successfully",
+            time: { start: 1, end: 2 },
+            attachments: [
+              { type: "file", mime: "image/png", url: `${tiny}1` },
+              { type: "file", mime: "image/png", url: `${tiny}2` },
+              { type: "file", mime: "image/png", url: `${tiny}3` },
+            ],
+          },
+        },
+      ],
+    },
+  ];
+
+  const pruned = pruneImages({ messages }, 1, 16 * 1024 * 1024);
+  expect(pruned).toBe(2);
+
+  const tool = (messages[1] as any).parts[0];
+  const attachments = tool.state.attachments;
+  expect(attachments.length).toBe(1);
+  expect(attachments[0].url).toBe(`${tiny}3`);
+
+  // Both cards live in the tool output next to the original text.
+  expect(tool.state.output).toContain("Image read successfully");
+  expect((tool.state.output.match(/\[Pruned Image:/g) || []).length).toBe(2);
+
+  // Downstream data URL filter must not throw and must keep the survivor.
+  const kept = attachments.filter((a: any) => a.url.startsWith("data:") && a.url.includes(","));
+  expect(kept.length).toBe(1);
+
+  // Compaction-style serialization must show defined labels plus cards.
+  const serialized = [
+    tool.state.output,
+    ...attachments.map((item: any) => `[Attached ${item.mime}: ${item.filename ?? "file"}]`),
+  ].join("\n");
+  expect(serialized).not.toContain("undefined");
+  expect(serialized).toContain("[Pruned Image:");
+});
