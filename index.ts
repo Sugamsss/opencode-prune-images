@@ -1345,6 +1345,10 @@ export default {
         await ctx.session.hook("context", async (event: unknown) => {
           pruneImages(event, getMaxImages(), getMaxImageBytes());
         });
+
+        await ctx.session.hook("compaction", async (event: unknown) => {
+          pruneImages(event, 0, 0);
+        });
       }
 
       // 2. Chat message transform hook
