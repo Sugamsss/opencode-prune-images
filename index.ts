@@ -26,6 +26,8 @@
  *      array with their card appended to that tool part's output text, since
  *      neither provider conversion nor the compaction serializer reads card
  *      text out of a replaced attachment object.
+ *    - Reads OpenCode 2.0.16 media parts, where the image sits in a nested
+ *      media asset ({ media: { source, mediaType } }).
  *
  * 4. Compaction Lifecycle Defense (Zero-Media Strip):
  *    - The plugin registers OpenCode's `compaction` session hook with zero image
@@ -33,6 +35,7 @@
  *    - Events marked with agent "compaction", or ending in /compact, also get
  *      zero budgets in any hook.
  *    - Compaction receives text cards instead of raw image data (issue #14562).
+ *    - The `context` and `generate` session hooks use the normal budgets.
  */
 
 import * as fs from "node:fs";
@@ -501,6 +504,7 @@ function isImagePart(part: unknown): boolean {
   if (p.type === "media") {
     return (
       isImageMime(p.mediaType) ||
+      isImageMime((p.media as Record<string, unknown> | undefined)?.mediaType) ||
       isImageMime(p.mime) ||
       isImageMime(p.mimeType) ||
       isImageDataUri(p.data) ||
@@ -536,7 +540,9 @@ function isImagePart(part: unknown): boolean {
 function extractImageMeta(part: unknown, fallbackSource?: string, autoName?: string): ImageMeta {
   if (!part || typeof part !== "object") return {};
   const p = part as Record<string, unknown>;
-  const sourceObj = p.source as Record<string, unknown> | undefined;
+  // OpenCode 2.0.16+ nests the image in a media asset: { media: { source, mediaType } }.
+  const mediaObj = p.media as Record<string, unknown> | undefined;
+  const sourceObj = (p.source ?? mediaObj?.source) as Record<string, unknown> | undefined;
   const imageUrlObj = p.image_url as Record<string, unknown> | undefined;
   const inlineDataObj = p.inlineData as Record<string, unknown> | undefined;
   const metadataObj = p.metadata as Record<string, unknown> | undefined;
@@ -577,6 +583,7 @@ function extractImageMeta(part: unknown, fallbackSource?: string, autoName?: str
     (isImageMime(p.mime) ? (p.mime as string) : undefined) ||
     (isImageMime(p.mimeType) ? (p.mimeType as string) : undefined) ||
     (isImageMime(p.mediaType) ? (p.mediaType as string) : undefined) ||
+    (isImageMime(mediaObj?.mediaType) ? (mediaObj!.mediaType as string) : undefined) ||
     (isImageMime(sourceObj?.media_type) ? (sourceObj!.media_type as string) : undefined) ||
     (isImageMime(inlineDataObj?.mimeType) ? (inlineDataObj!.mimeType as string) : undefined);
 
@@ -1354,12 +1361,14 @@ export default {
 
     // 1. Session hooks (OpenCode v2). The compaction request is not marked as
     // compaction in its event, so it gets its own hook with zero budgets.
+    // `generate` is the one-shot request that reuses the session history
+    // (for example /btw), so it gets the normal budgets.
     if (session?.hook) {
-      await register("context", () =>
-        session.hook!("context", async (event: unknown) => {
-          pruneImages(event, getMaxImages(), getMaxImageBytes());
-        })
-      );
+      const prune = async (event: unknown) => {
+        pruneImages(event, getMaxImages(), getMaxImageBytes());
+      };
+      await register("context", () => session.hook!("context", prune));
+      await register("generate", () => session.hook!("generate", prune));
       await register("compaction", () =>
         session.hook!("compaction", async (event: unknown) => {
           pruneImages(event, 0, 0);

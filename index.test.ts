@@ -609,7 +609,33 @@ test("compaction session hook strips every image even when the event is not mark
 
 test("a hook that fails to register does not stop the others", async () => {
   const handlers = await setupHooks(["context"]);
-  expect([...handlers.keys()].sort()).toEqual(["compaction", "experimental.chat.messages.transform"]);
+  expect([...handlers.keys()].sort()).toEqual(["compaction", "experimental.chat.messages.transform", "generate"]);
+});
+
+test("OpenCode 2.0.16 media parts are detected, byte-budgeted, cached, and carded", () => {
+  // The real 2.0.16 user attachment shape: the image lives in a nested media
+  // asset, and pasted images have no filename.
+  const png = (fill: number) =>
+    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, ...new Array(1500).fill(fill)]).toString("base64");
+  const media = (data: string, filename?: string) => ({
+    type: "media",
+    media: { source: { type: "base64", data, mediaType: "image/png" }, mediaType: "image/png", kind: "image" },
+    ...(filename ? { filename } : {}),
+  });
+  const messages = [
+    { role: "user", content: [{ type: "text", text: "pasted header" }, media(png(1))] },
+    { role: "user", content: [{ type: "text", text: "named header" }, media(png(2), "header-2.png")] },
+    { role: "user", content: [{ type: "text", text: "newest header" }, media(png(3))] },
+  ];
+
+  // The count allows all three; the bytes allow only the newest.
+  expect(pruneImages({ messages }, 7, 1.5 * png(0).length)).toBe(2);
+  expect(messages[2].content[1].type).toBe("media");
+
+  const cards = [0, 1].map((i) => (messages[i].content[1] as { text?: string }).text ?? "");
+  expect(cards[1]).toContain("header-2.png");
+  const cachedPath = cards[0].match(/^\[Pruned Image: (.+)\]$/m)?.[1] ?? "";
+  expect(fs.readFileSync(cachedPath)).toEqual(Buffer.from(png(1), "base64"));
 });
 
 test("V1 tool attachments prune to output cards without breaking downstream shapes", () => {
