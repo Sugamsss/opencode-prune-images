@@ -29,6 +29,8 @@ still matter.
   The V1 compaction transform carries no compaction marker, so it uses the
   normal budgets there.
 - Avoids double-wrapping cards that it has already created.
+- Recognizes OpenCode 2.0.16 image attachments, where the image data sits in a
+  nested `media` object, including pasted images that have no filename.
 - Handles V1 tool attachments by removing pruned entries from
   `state.attachments` and appending their cards to that tool part's output
   text. This keeps provider conversion and compaction serialization working,
@@ -65,8 +67,9 @@ exceeded.
         [Provider request]
 ```
 
-On OpenCode v2 the plugin registers two session hooks: `context` for normal
-requests, with the normal budgets, and `compaction`, with zero budgets. It also
+On OpenCode v2 the plugin registers three session hooks: `context` for normal
+requests and `generate` for one-shot requests such as `/btw`, both with the
+normal budgets, and `compaction`, with zero budgets. It also
 registers the `experimental.chat.messages.transform` hook when available, which
 fires before provider conversion on normal requests and before serialization on
 the V1 compaction path. Each hook registers on its own, so one failure does not
