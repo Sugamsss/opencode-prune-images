@@ -573,6 +573,45 @@ test("plugin structure satisfies OpenCode plugin signature", async () => {
   expect(hookRegistered).toBe(true);
 });
 
+// Registers the plugin against a fake OpenCode context and returns the
+// handlers by hook name. Names in `failing` throw on registration.
+async function setupHooks(failing: string[] = []) {
+  const handlers = new Map<string, (...args: unknown[]) => unknown>();
+  const add = (name: string, fn: (...args: unknown[]) => unknown) => {
+    if (failing.includes(name)) throw new Error(`cannot register ${name}`);
+    handlers.set(name, fn);
+  };
+  await plugin.setup({ session: { hook: async (name, fn) => add(name, fn) }, hook: add });
+  return handlers;
+}
+
+test("compaction session hook strips every image even when the event is not marked as compaction", async () => {
+  const compaction = (await setupHooks()).get("compaction");
+  expect(compaction).toBeDefined();
+
+  // OpenCode v2 runs compaction under the session's agent, so nothing in the
+  // event says "compaction". Three images fit the normal budget of seven.
+  const png = "data:image/png;base64,iVBORw0KGgo" + "A".repeat(400);
+  const event = {
+    agent: "build",
+    messages: [0, 1, 2].map((i) => ({
+      role: "tool",
+      content: [{ type: "tool-result", id: `t${i}`, name: "screenshot",
+        result: { type: "content", value: [{ type: "file", uri: png + i, mime: "image/png", name: `s${i}.png` }] } }],
+    })),
+  };
+  await compaction!(event);
+
+  const values = event.messages.flatMap((m) => m.content.flatMap((p) => p.result.value as { type: string; text?: string }[]));
+  expect(values.filter((v) => v.type === "file")).toHaveLength(0);
+  expect(values.every((v) => String(v.text).includes("[Pruned Image:"))).toBe(true);
+});
+
+test("a hook that fails to register does not stop the others", async () => {
+  const handlers = await setupHooks(["context"]);
+  expect([...handlers.keys()].sort()).toEqual(["compaction", "experimental.chat.messages.transform"]);
+});
+
 test("V1 tool attachments prune to output cards without breaking downstream shapes", () => {
   // Real read-tool shape: type file attachments with data URLs under
   // state.attachments. Pruned entries must leave the array and land in

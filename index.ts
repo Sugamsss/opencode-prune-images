@@ -28,10 +28,11 @@
  *      text out of a replaced attachment object.
  *
  * 4. Compaction Lifecycle Defense (Zero-Media Strip):
- *    - When event.agent === "compaction" or on /compact requests, effectiveMaxImages and effectiveMaxBytes
- *      are clamped to 0.
- *    - 100% of images are cleanly converted into 3-point context cards with zero raw base64 sent to the model,
- *      so compaction receives text cards instead of raw image data (issue #14562).
+ *    - The plugin registers OpenCode's `compaction` session hook with zero image
+ *      and byte budgets, because that event is not marked as compaction.
+ *    - Events marked with agent "compaction", or ending in /compact, also get
+ *      zero budgets in any hook.
+ *    - Compaction receives text cards instead of raw image data (issue #14562).
  */
 
 import * as fs from "node:fs";
@@ -1095,7 +1096,9 @@ function findV1ToolAttachmentOwner(
  * Check if the current context event or message payload indicates compaction.
  *
  * OpenCode compaction lifecycle:
- * - Either automatic or manual (/compact), OpenCode triggers context hooks with event.agent === "compaction".
+ * - OpenCode v2 sends compaction through its own `compaction` session hook,
+ *   which the plugin registers with zero budgets. This check is a fallback for
+ *   events marked with agent "compaction".
  * - Or the last user message requests a compaction/summary.
  * - Compaction should receive a text summary rather than raw image data.
  * - Passing raw base64 images into compaction can cause payload errors (OpenCode issue #14562).
@@ -1339,28 +1342,40 @@ export interface OpenCodePluginHooks {
 export default {
   id: "opencode.prune-images",
   setup: async (ctx: OpenCodePluginContext): Promise<void> => {
-    try {
-      // 1. Session context hook (OpenCode preview / v2 architecture)
-      if (ctx?.session?.hook) {
-        await ctx.session.hook("context", async (event: unknown) => {
-          pruneImages(event, getMaxImages(), getMaxImageBytes());
-        });
-
-        await ctx.session.hook("compaction", async (event: unknown) => {
-          pruneImages(event, 0, 0);
-        });
+    // Each hook registers on its own so one failure cannot skip the others.
+    const register = async (name: string, add: () => unknown): Promise<void> => {
+      try {
+        await add();
+      } catch (err) {
+        console.error(`[prune-images] failed to register ${name} hook:`, err);
       }
+    };
+    const session = ctx?.session;
 
-      // 2. Chat message transform hook
-      if (typeof ctx?.hook === "function") {
-        ctx.hook("experimental.chat.messages.transform", async (_input: unknown, output: unknown) => {
+    // 1. Session hooks (OpenCode v2). The compaction request is not marked as
+    // compaction in its event, so it gets its own hook with zero budgets.
+    if (session?.hook) {
+      await register("context", () =>
+        session.hook!("context", async (event: unknown) => {
+          pruneImages(event, getMaxImages(), getMaxImageBytes());
+        })
+      );
+      await register("compaction", () =>
+        session.hook!("compaction", async (event: unknown) => {
+          pruneImages(event, 0, 0);
+        })
+      );
+    }
+
+    // 2. Chat message transform hook
+    if (typeof ctx?.hook === "function") {
+      await register("experimental.chat.messages.transform", () =>
+        ctx.hook!("experimental.chat.messages.transform", async (_input: unknown, output: unknown) => {
           if (output && typeof output === "object" && Array.isArray((output as Record<string, unknown>).messages)) {
             pruneImages(output, getMaxImages(), getMaxImageBytes());
           }
-        });
-      }
-    } catch (err) {
-      console.error("[prune-images] setup hook registration error:", err);
+        })
+      );
     }
   },
   server: async (): Promise<OpenCodePluginHooks> => ({
