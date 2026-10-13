@@ -1,46 +1,37 @@
 # opencode-prune-images
 
-An OpenCode plugin that keeps image-heavy chats manageable.
+Intelligent image context manager and rolling buffer for OpenCode.
 
-Browser work, screenshots, and visual checks can add many image attachments to
-one conversation. Large requests may hit a provider or gateway limit. This
-plugin changes the outgoing context before it is sent: it keeps the newest
-images within two budgets and replaces older images with small recall cards.
+When agent workflows use browser tools (Playwright, Chrome DevTools) or visual iteration loops, sessions quickly accumulate dozens of screenshots. Upstream providers reject requests with fatal errors:
 
-It is deliberately conservative about what it promises. It reduces image
-payload pressure, but it cannot guarantee that every provider accepts every
-request. Provider limits, prompt size, tool schemas, and other request data
-still matter.
+- `400 invalid_request_error: request contains 51 images, exceeding the maximum of 50 allowed per request`
+- `413 Request Entity Too Large` / payload ceilings (Cloudflare, Azure, reverse proxies)
+
+Once this happens, the session gets wedged because the bulky images remain in conversation history. 
+
+### Why this is still needed on OpenCode 2.0
+
+OpenCode 2.0 natively bounds inline image bytes (triggering above 25 MiB and reducing to 15 MiB). However, **OpenCode 2.0 enforces no image-count limit** and **does not classify image-count errors as context overflow**. If an agent collects 51 small screenshots (e.g. 50 KB each, totaling ~2.5 MiB), OpenCode 2.0 still sends all 51 images to the provider. The provider rejects the request with HTTP 400, recovery never kicks in, and the session permanently bricks. Furthermore, when core removes an image, it leaves a generic blind placeholder with no file path or context.
+
+`opencode-prune-images` solves the entire problem:
+- **Dual-Budget Protection (Count + Bytes)**: Keeps the newest images within both a count limit (default 7) and a cumulative wire Base64 payload limit (default 16 MiB).
+- **Conversational 3-Point Cards**: Instead of dropping images into a black hole, older images are summarized into structured context cards capturing what was observed, why it was captured, and the exact path for recall.
+- **Rolling FIFO Disk Buffer**: Ephemeral `/tmp` captures and pasted base64 data are backed up to `~/.cache/opencode/recent-images/` (100 files FIFO) so screenshots don't vanish if `/tmp` is wiped.
+- **Compaction Defense**: Media is safely carded during compaction so compaction never fails on media payloads.
+- **Universal Compatibility**: Works across OpenCode 2.x (including 2.0.16+ nested media assets and Uint8Array binary buffers) and OpenCode 1.x.
 
 ## What it does
 
-- Keeps up to **7 newest images** in the active context by default.
-- Keeps their estimated cumulative wire Base64 payload under **16 MiB** by
-  default (`16,777,216` bytes).
-- Allocates the budgets from newest to oldest. A large recent image can cause
-  older images to become cards even when there are fewer than seven images.
-- Replaces pruned images with a three-point card containing the cached path,
-  what was visible, why it was captured, and a best-effort way to recall it.
-- Copies pasted data and ephemeral `/tmp` captures into a rolling cache with a
-  default cap of **100 files**.
-- Removes recognized image data from the outgoing context during compaction,
-  leaving text cards for the compaction model. On OpenCode v2 the plugin
-  registers the `compaction` session hook with zero image and byte budgets.
-  The V1 compaction transform carries no compaction marker, so it uses the
-  normal budgets there.
+- Keeps up to **7 newest images** in the active context by default (configurable via `OPENCODE_MAX_IMAGES`).
+- Keeps their estimated cumulative wire Base64 payload under **16 MiB** by default (`16,777,216` bytes, configurable via `OPENCODE_MAX_IMAGE_BYTES`).
+- Allocates the budgets from newest to oldest. A large recent image can cause older images to become cards even when there are fewer than seven images.
+- Replaces pruned images with a rich 3-point card containing the cached path, what was observed, why it was captured, and recall guidance.
+- Copies pasted data, Uint8Array binary assets, and ephemeral `/tmp` captures into a rolling cache with a default cap of **100 files**.
+- Removes recognized image data from the outgoing context during compaction, leaving text cards for the compaction model. On OpenCode v2 the plugin registers the `compaction` session hook with zero image and byte budgets.
 - Avoids double-wrapping cards that it has already created.
-- Recognizes OpenCode 2.0.16 image attachments, where the image data sits in a
-  nested `media` object, including pasted images that have no filename.
-- Handles V1 tool attachments by removing pruned entries from
-  `state.attachments` and appending their cards to that tool part's output
-  text. This keeps provider conversion and compaction serialization working,
-  since neither path reads card text out of a replaced attachment object.
+- Supports native OpenCode 2.x media parts (`Media.Asset`, Uint8Array bytes, base64 data) and structured tool-result file content, as well as V1 tool attachments.
 
-The transformation is **outgoing-context only**. It runs in memory in the
-OpenCode context/message hook. It does not rewrite the conversation transcript
-or delete image rows from OpenCode's SQLite history. The cache is also not a
-permanent archive: its oldest files are removed when the 100-file cap is
-exceeded.
+The transformation is **outgoing-context only**. It runs in memory right before provider dispatch. It does not rewrite the conversation transcript or delete image rows from OpenCode's SQLite history.
 
 ## How it works
 

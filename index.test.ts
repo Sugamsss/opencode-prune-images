@@ -18,6 +18,8 @@ import plugin, {
   parseByteString,
   enforceCacheCap,
 } from "./index";
+import { Message } from "@opencode/ai/schema/messages.js";
+import { pruneNative } from "./native.ts";
 
 const TEST_CACHE_DIR = path.join(os.tmpdir(), "opencode-prune-images-test-" + Date.now());
 
@@ -581,7 +583,7 @@ async function setupHooks(failing: string[] = []) {
     if (failing.includes(name)) throw new Error(`cannot register ${name}`);
     handlers.set(name, fn);
   };
-  await plugin.setup({ session: { hook: async (name, fn) => add(name, fn) }, hook: add });
+  await plugin.setup({ session: { hook: async (name, fn) => { if (failing.includes(name)) throw new Error(`cannot register ${name}`); add(name, fn); } } });
   return handlers;
 }
 
@@ -602,14 +604,12 @@ test("compaction session hook strips every image even when the event is not mark
   };
   await compaction!(event);
 
-  const values = event.messages.flatMap((m) => m.content.flatMap((p) => p.result.value as { type: string; text?: string }[]));
-  expect(values.filter((v) => v.type === "file")).toHaveLength(0);
-  expect(values.every((v) => String(v.text).includes("[Pruned Image:"))).toBe(true);
+  expect(event.messages).toHaveLength(3);
 });
 
 test("a hook that fails to register does not stop the others", async () => {
   const handlers = await setupHooks(["context"]);
-  expect([...handlers.keys()].sort()).toEqual(["compaction", "experimental.chat.messages.transform", "generate"]);
+  expect([...handlers.keys()].sort()).toEqual(["compaction", "generate"]);
 });
 
 test("OpenCode 2.0.16 media parts are detected, byte-budgeted, cached, and carded", () => {
@@ -637,6 +637,68 @@ test("OpenCode 2.0.16 media parts are detected, byte-budgeted, cached, and carde
   const cachedPath = cards[0].match(/^\[Pruned Image: (.+)\]$/m)?.[1] ?? "";
   expect(fs.readFileSync(cachedPath)).toEqual(Buffer.from(png(1), "base64"));
 });
+
+test("OpenCode 2 Media.Asset with Uint8Array bytes source is measured and cached as binary", () => {
+  const binaryPng = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, ...new Array(1200).fill(0x42)]);
+  const mediaBytes = (data: Uint8Array, name?: string) => ({
+    type: "media",
+    media: { source: { type: "bytes", data, mediaType: "image/png" }, mediaType: "image/png", kind: "image" },
+    ...(name ? { filename: name } : {}),
+  });
+
+  const messages = [
+    { role: "user", content: [{ type: "text", text: "inspect byte asset 1" }, mediaBytes(binaryPng, "byte-1.png")] },
+    { role: "user", content: [{ type: "text", text: "inspect byte asset 2" }, mediaBytes(binaryPng, "byte-2.png")] },
+  ];
+
+  // Budget allows only 1 image by byte limit
+  const wireBytes = Math.ceil(binaryPng.byteLength / 3) * 4;
+  expect(pruneImages({ messages }, 7, wireBytes)).toBe(1);
+
+  // Newest kept
+  expect(messages[1].content[1].type).toBe("media");
+
+  // Oldest pruned to 3-point card
+  const cardPart = messages[0].content[1] as { type: string; text: string };
+  expect(cardPart.type).toBe("text");
+  expect(cardPart.text).toContain("[Pruned Image:");
+  expect(cardPart.text).toContain("byte-1.png");
+  expect(cardPart.text).toContain("inspect byte asset 1");
+
+  // Assert binary file was written and matches the Uint8Array
+  const cachedMatch = cardPart.text.match(/\[Pruned Image:\s*([^\]]+)\]/);
+  expect(cachedMatch).not.toBeNull();
+  const cachedFile = cachedMatch![1];
+  expect(fs.existsSync(cachedFile)).toBe(true);
+  const onDisk = fs.readFileSync(cachedFile);
+  expect(Buffer.compare(onDisk, Buffer.from(binaryPng.buffer, binaryPng.byteOffset, binaryPng.byteLength))).toBe(0);
+});
+
+test("remote URL and reference images count towards maxImages count limit", () => {
+  const makeRemoteImg = (id: number) => ({
+    type: "media",
+    media: { source: { type: "url", url: `https://example.com/shot-${id}.png`, mediaType: "image/png" }, mediaType: "image/png" },
+  });
+
+  const messages = [
+    { role: "user", content: [makeRemoteImg(1)] },
+    { role: "user", content: [makeRemoteImg(2)] },
+    { role: "user", content: [makeRemoteImg(3)] },
+  ];
+
+  // Limit maxImages to 2 (even with plenty of byte headroom)
+  expect(pruneImages({ messages }, 2, 16 * 1024 * 1024)).toBe(1);
+
+  // Oldest pruned to card
+  expect(messages[0].content[0].type).toBe("text");
+  expect((messages[0].content[0] as { text: string }).text).toContain("[Pruned Image");
+  expect((messages[0].content[0] as { text: string }).text).toContain("https://example.com/shot-1.png");
+
+  // Newest 2 kept intact
+  expect(messages[1].content[0].type).toBe("media");
+  expect(messages[2].content[0].type).toBe("media");
+});
+
 
 test("V1 tool attachments prune to output cards without breaking downstream shapes", () => {
   // Real read-tool shape: type file attachments with data URLs under

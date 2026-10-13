@@ -1,7 +1,7 @@
 {
   "name": "opencode-prune-images",
-  "version": "1.2.0",
-  "description": "Source-only OpenCode plugin that bounds image count and payload size while preserving causal recall cards.",
+  "version": "1.3.0",
+  "description": "Dual-budget context manager and rolling buffer for OpenCode. Enforces image-count and payload bounds with causal 3-point recall cards.",
   "main": "index.ts",
   "private": true,
   "type": "module",
@@ -22,6 +22,10 @@
   "repository": {
     "type": "git",
     "url": "https://github.com/Sugamsss/opencode-prune-images"
+  },
+  "dependencies": {
+    "@opencode/ai": "2.0.27",
+    "@opencode/plugin": "2.0.27"
   },
   "devDependencies": {
     "@types/node": "^22.13.9",

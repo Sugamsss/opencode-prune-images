@@ -301,10 +301,42 @@ function isTmpPath(filePath: string): boolean {
 export function persistToRollingCache(
   dataUriOrBase64: string | undefined,
   existingPath: string | undefined,
-  mime?: string
+  mime?: string,
+  rawBytes?: Uint8Array | Buffer
 ): string | undefined {
   try {
     ensureCacheDir();
+
+    // Case 0: Raw binary bytes (Uint8Array / Buffer from OpenCode 2 Media.Asset)
+    if (rawBytes && (rawBytes instanceof Uint8Array || Buffer.isBuffer(rawBytes)) && rawBytes.byteLength > 0) {
+      const binary = Buffer.from(rawBytes.buffer, rawBytes.byteOffset, rawBytes.byteLength);
+      const sha = crypto.createHash("sha256").update(binary).digest("hex").slice(0, 16);
+      const hashKey = `bytes:${sha}`;
+      const cached = imagePathCache.get(hashKey);
+      if (cached && fs.existsSync(cached)) {
+        return cached;
+      }
+
+      let detectedMime = mime;
+      if (!detectedMime || detectedMime.includes("octet-stream")) {
+        const sniffed = sniffImageHeader(binary);
+        if (sniffed) {
+          detectedMime = sniffed.mime;
+        }
+      }
+
+      const ext = extensionForMime(detectedMime);
+      const targetName = `img_${sha}.${ext}`;
+      const targetPath = path.join(currentCacheDir, targetName);
+
+      if (!fs.existsSync(targetPath)) {
+        fs.writeFileSync(targetPath, binary);
+      }
+
+      imagePathCache.set(hashKey, targetPath);
+      enforceCacheCap();
+      return targetPath;
+    }
 
     // Case 1: Existing file path
     if (existingPath && typeof existingPath === "string") {
@@ -422,6 +454,7 @@ export interface ImageMeta {
   dimensions?: string;
   source?: string;
   rawBase64?: string;
+  rawBytes?: Uint8Array | Buffer;
   byteSize?: number;
 }
 
@@ -502,9 +535,14 @@ function isImagePart(part: unknown): boolean {
   if (p.type === "image" || p.type === "image_url") return true;
 
   if (p.type === "media") {
+    const mediaObj = p.media as Record<string, unknown> | undefined;
+    const mediaSource = mediaObj?.source as Record<string, unknown> | undefined;
+    const directSource = p.source as Record<string, unknown> | undefined;
     return (
       isImageMime(p.mediaType) ||
-      isImageMime((p.media as Record<string, unknown> | undefined)?.mediaType) ||
+      isImageMime(mediaObj?.mediaType) ||
+      isImageMime(mediaSource?.mediaType) ||
+      isImageMime(directSource?.mediaType) ||
       isImageMime(p.mime) ||
       isImageMime(p.mimeType) ||
       isImageDataUri(p.data) ||
@@ -584,10 +622,19 @@ function extractImageMeta(part: unknown, fallbackSource?: string, autoName?: str
     (isImageMime(p.mimeType) ? (p.mimeType as string) : undefined) ||
     (isImageMime(p.mediaType) ? (p.mediaType as string) : undefined) ||
     (isImageMime(mediaObj?.mediaType) ? (mediaObj!.mediaType as string) : undefined) ||
+    (isImageMime(sourceObj?.mediaType) ? (sourceObj!.mediaType as string) : undefined) ||
     (isImageMime(sourceObj?.media_type) ? (sourceObj!.media_type as string) : undefined) ||
     (isImageMime(inlineDataObj?.mimeType) ? (inlineDataObj!.mimeType as string) : undefined);
 
   let mime = mimeCandidate ? mimeCandidate.trim().toLowerCase() : undefined;
+
+  let rawBytes: Uint8Array | Buffer | undefined;
+  if (
+    sourceObj?.type === "bytes" &&
+    (sourceObj.data instanceof Uint8Array || Buffer.isBuffer(sourceObj.data))
+  ) {
+    rawBytes = sourceObj.data;
+  }
 
   let rawBase64: string | undefined;
   const rawDataCandidate =
@@ -623,7 +670,7 @@ function extractImageMeta(part: unknown, fallbackSource?: string, autoName?: str
     fallbackSource ||
     undefined;
 
-  return { name, path: pathVal, url, mime, dimensions, source, rawBase64 };
+  return { name, path: pathVal, url, mime, dimensions, source, rawBase64, rawBytes };
 }
 
 function extractMessageText(msg: unknown): string {
@@ -679,6 +726,11 @@ function cleanAndTruncate(text: string, maxLen = 180): string {
 export function estimateImageBytes(meta: ImageMeta): number {
   if (meta.byteSize && meta.byteSize > 0) {
     return meta.byteSize;
+  }
+
+  // 0. Raw binary bytes (Uint8Array / Buffer from OpenCode 2 Media.Asset)
+  if (meta.rawBytes) {
+    return Math.ceil(meta.rawBytes.byteLength / 3) * 4;
   }
 
   // 1. Raw base64 / data URI
@@ -822,11 +874,19 @@ export function formatThreePointCard(
   observed: string,
   intent: string
 ): string {
+  const hasPath = cachedPath && cachedPath.trim().length > 0 && !cachedPath.endsWith("/");
+  const header = hasPath ? `[Pruned Image: ${cachedPath}]` : `[Pruned Image]`;
+  const recall = hasPath
+    ? (isRemoteImageUrl(cachedPath)
+        ? `• Recall: Remote reference \`${cachedPath}\`. If needed again, re-fetch or ask user to re-attach.`
+        : `• Recall: If needed again, read from \`${cachedPath}\`. If missing, rely on the summary above—or if safe to reproduce, re-capture the screen.`)
+    : `• Recall: No verified local copy. If needed again, retrieve with an available tool or ask user to re-attach.`;
+
   return [
-    `[Pruned Image: ${cachedPath}]`,
+    header,
     `• What's visible: ${observed}`,
     `• Why it was captured: ${intent}`,
-    `• Recall: If needed again, read from \`${cachedPath}\`. If missing, rely on the summary above—or if safe to reproduce, re-capture the screen.`,
+    recall,
   ].join("\n");
 }
 
@@ -1239,10 +1299,10 @@ export function pruneImages(
 
       // a. Ensure persisted to rolling buffer
       const cachedPath =
-        persistToRollingCache(ref.meta.rawBase64, ref.meta.path, ref.meta.mime) ||
+        persistToRollingCache(ref.meta.rawBase64, ref.meta.path, ref.meta.mime, ref.meta.rawBytes) ||
         ref.meta.path ||
         ref.meta.url ||
-        "~/.cache/opencode/recent-images/";
+        "";
 
       // b. Synthesize context from causal conversational turns
       const { observed, intent } = synthesizeContext(messages, ref);
@@ -1346,18 +1406,27 @@ export interface OpenCodePluginHooks {
   [key: string]: unknown;
 }
 
+const legacyServer = async (): Promise<OpenCodePluginHooks> => ({
+  "experimental.chat.messages.transform": async (_input: unknown, output: unknown) => {
+    if (output && typeof output === "object" && Array.isArray((output as Record<string, unknown>).messages)) {
+      pruneImages(output, getMaxImages(), getMaxImageBytes());
+    }
+  },
+});
+
 export default {
   id: "opencode.prune-images",
   setup: async (ctx: OpenCodePluginContext): Promise<void> => {
-    // Each hook registers on its own so one failure cannot skip the others.
-    const register = async (name: string, add: () => unknown): Promise<void> => {
+    const session = ctx?.session;
+
+    // Helper to register a hook independently so one failure does not block the others.
+    const register = async (name: string, fn: () => Promise<void> | void) => {
       try {
-        await add();
+        await fn();
       } catch (err) {
         console.error(`[prune-images] failed to register ${name} hook:`, err);
       }
     };
-    const session = ctx?.session;
 
     // 1. Session hooks (OpenCode v2). The compaction request is not marked as
     // compaction in its event, so it gets its own hook with zero budgets.
@@ -1376,22 +1445,16 @@ export default {
       );
     }
 
-    // 2. Chat message transform hook
+    // 2. Chat message transform hook (legacy / fallback)
     if (typeof ctx?.hook === "function") {
-      await register("experimental.chat.messages.transform", () =>
+      await register("experimental.chat.messages.transform", async () => {
         ctx.hook!("experimental.chat.messages.transform", async (_input: unknown, output: unknown) => {
           if (output && typeof output === "object" && Array.isArray((output as Record<string, unknown>).messages)) {
             pruneImages(output, getMaxImages(), getMaxImageBytes());
           }
-        })
-      );
+        });
+      });
     }
   },
-  server: async (): Promise<OpenCodePluginHooks> => ({
-    "experimental.chat.messages.transform": async (_input: unknown, output: unknown) => {
-      if (output && typeof output === "object" && Array.isArray((output as Record<string, unknown>).messages)) {
-        pruneImages(output, getMaxImages(), getMaxImageBytes());
-      }
-    },
-  }),
+  server: legacyServer,
 };
